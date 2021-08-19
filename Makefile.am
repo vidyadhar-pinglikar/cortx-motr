@@ -198,7 +198,7 @@ motr_includedir             = $(includedir)/motr
 # which are then included into this top-level makefile
 nobase_motr_include_HEADERS  = config.h
 if ENABLE_LUSTRE
-nobase_motr_include_HEADERS += lustre_config.h
+#nobase_motr_include_HEADERS += lustre_config.h
 endif
 nobase_nodist_motr_include_HEADERS = $(XC_FILES) $(XC_FILES_EXTERN)
 motr_libmotr_la_SOURCES =
@@ -909,9 +909,9 @@ include $(top_srcdir)/hsm/Makefile.sub
 # isc/libm0isc.so,m0iscdemo,m0iscreg ------------------------------------ {{{2
 #
 
-lib_LTLIBRARIES          += iscservice/demo/libm0isc.la
-iscservice_demo_libm0isc_la_CPPFLAGS = -DM0_TARGET='libm0isc' $(AM_CPPFLAGS)
-iscservice_demo_libm0isc_la_LDFLAGS  = -version-info 1:0:0 $(AM_LDFLAGS)
+#lib_LTLIBRARIES          += iscservice/demo/libm0isc.la
+#iscservice_demo_libm0isc_la_CPPFLAGS = -DM0_TARGET='libm0isc' $(AM_CPPFLAGS)
+#iscservice_demo_libm0isc_la_LDFLAGS  = -version-info 1:0:0 $(AM_LDFLAGS)
 
 bin_PROGRAMS += iscservice/demo/m0iscdemo
 iscservice_demo_m0iscdemo_CPPFLAGS = -DM0_TARGET='m0iscdemo' $(AM_CPPFLAGS)
