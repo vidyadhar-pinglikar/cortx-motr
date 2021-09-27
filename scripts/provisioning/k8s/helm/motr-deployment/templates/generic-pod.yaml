@@ -3,11 +3,11 @@
 apiVersion: v1
 kind: Pod
 metadata:
-  name: data-service{{ $node }}
+  name: data-service{{add $podNum 1}}
   labels:
     app: node{{add $podNum 1}}-pods
 spec:
-  hostname: data-service{{ $node }}
+  hostname: data-service{{add $podNum 1}}
   containers:
   {{- range $i, $container := $.Values.containerSpecs }}
   - name: {{ $container.name }}
