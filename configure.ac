@@ -496,7 +496,7 @@ allowed values are: SOCK, LNET, MEMBULK and LF])
         )
       ],
       [
-	AC_DEFINE_UNQUOTED([M0_DEFAULT_NETWORK], ["SOCK"])
+	AC_DEFINE_UNQUOTED([M0_DEFAULT_NETWORK], ["LNET"])
       ]
 )
 
