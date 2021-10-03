@@ -685,10 +685,15 @@ static void libfab_tm_buf_timeout(struct m0_fab__tm *ftm)
 		m0_tl_for(m0_net_tm, &net->ntm_q[i], nb) {
 			if (nb->nb_timeout < now) {
 				fb = nb->nb_xprt_private;
-				nb->nb_flags |= M0_NET_BUF_TIMED_OUT;
-				libfab_buf_dom_dereg(fb);
-				fb->fb_state = FAB_BUF_TIMEDOUT;
-				libfab_buf_done(fb, -ETIMEDOUT);
+				if (fb->fb_status == -ECONNREFUSED) {
+					fb->fb_status = 0;
+					libfab_buf_done(fb, 0);
+				} else {
+					nb->nb_flags |= M0_NET_BUF_TIMED_OUT;
+					libfab_buf_dom_dereg(fb);
+					fb->fb_state = FAB_BUF_TIMEDOUT;
+					libfab_buf_done(fb, -ETIMEDOUT);
+				}
 			}
 		} m0_tl_endfor;
 	}
@@ -2346,6 +2351,22 @@ static int libfab_conn_init(struct m0_fab__ep *ep, struct m0_fab__tm *ma,
 	
 	if (ret == 0)
 		fab_sndbuf_tlink_init_at_tail(fbp, &ep->fep_sndbuf);
+
+	/*
+	 * If the fi_connect immediately return -ECONNREFUSED, that means the
+	 * the remote service has not yet started. In this case, set the buffer
+	 * timeout to 1 seconds and return the status as 0 so as to avoid
+	 * flooding the network with repeated retries by the RPC layer. The
+	 * buffer status will be automatically returned after the buffer timeout
+	 * as -ETIMEDOUT (mocking behaviour of connectionless endpoints).
+	 */
+	if (ret == -ECONNREFUSED) {
+		fbp->fb_nb->nb_timeout = m0_time_from_now(1, 0);
+		fbp->fb_status = -ECONNREFUSED;
+		ret = 0;
+		M0_LOG(M0_DEBUG, "Err=%d fb=%p nb=%p", fbp->fb_status, fbp,
+		       fbp->fb_nb);
+	}
 
 	return ret;
 }
