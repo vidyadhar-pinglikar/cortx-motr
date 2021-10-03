@@ -115,7 +115,7 @@ enum m0_rpc_item_resend {
 	/**
 	 * @todo Provide proper value for re-send interval
 	 */
-	M0_RPC_ITEM_RESEND_INTERVAL =   2, /* in secs */
+	M0_RPC_ITEM_RESEND_INTERVAL =   3, /* in secs */
 	M0_RPC_ITEM_REPLY_CACHE_TMO = 100, /* refer to M0T1FS_RPC_TIMEOUT */
 	M0_RPC_ITEM_REQ_CACHE_TMO   = 100, /* refer to M0T1FS_RPC_TIMEOUT */
 };

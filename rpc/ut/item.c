@@ -890,7 +890,7 @@ static void test_cancel_session(void)
 	 */
 	M0_UT_ASSERT(session->s_cancelled == true);
 	M0_UT_ASSERT(session->s_xid > 0);
-	rc = m0_rpc_session_destroy(session, m0_time_from_now(TIMEOUT, 0));
+	rc = m0_rpc_session_destroy(session, m0_time_from_now((TIMEOUT*4), 0));
 	M0_UT_ASSERT(rc == 0);
 	rc = m0_rpc_session_create(session, cctx.rcx_session.s_conn,
 				   m0_time_from_now(TIMEOUT, 0));
