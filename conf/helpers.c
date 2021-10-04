@@ -144,6 +144,8 @@ static int _conf_load(struct m0_conf_root *root,
 {
 	struct m0_conf_diter  it;
 	int                   rc;
+	m0_time_t             start = m0_time_now();
+	m0_time_t             end;
 
 	M0_PRE(path != NULL);
 
@@ -159,12 +161,20 @@ static int _conf_load(struct m0_conf_root *root,
 		;
 	m0_conf_diter_fini(&it);
 
+	end = m0_time_now();
+
+	M0_LOG(M0_DEBUG,"start=%"PRIu64" end=%"PRIu64" diff=%"PRIu64" fid="FID_F,
+		start, end, m0_time_sub(end, start), FID_P(path));
+
 	return M0_RC(rc);
 }
 
 M0_INTERNAL int m0_conf_full_load(struct m0_conf_root *r)
 {
-	int rc;
+	int       rc;
+	m0_time_t start;
+	m0_time_t end;
+
 	const struct m0_fid to_sdevs[]  = {M0_CONF_ROOT_NODES_FID,
 	                                   M0_CONF_NODE_PROCESSES_FID,
 	                                   M0_CONF_PROCESS_SERVICES_FID,
@@ -185,11 +195,18 @@ M0_INTERNAL int m0_conf_full_load(struct m0_conf_root *r)
 	const struct m0_fid to_fdmifs[] = {M0_CONF_ROOT_FDMI_FLT_GRPS_FID,
 	                                   M0_CONF_FDMI_FGRP_FILTERS_FID};
 
+	start = m0_time_now();
+	
 	rc = _conf_load(r, to_sdevs,  ARRAY_SIZE(to_sdevs)) ?:
 	     _conf_load(r, to_drives, ARRAY_SIZE(to_drives)) ?:
 	     _conf_load(r, to_drvsvs, ARRAY_SIZE(to_drvsvs)) ?:
 	     _conf_load(r, to_profs,  ARRAY_SIZE(to_profs)) ?:
 	     _conf_load(r, to_fdmifs, ARRAY_SIZE(to_fdmifs));
+
+	end = m0_time_now();
+
+	M0_LOG(M0_ALWAYS,"start=%"PRIu64" end=%"PRIu64" diff=%"PRIu64" fid="FID_F,
+		start, end, m0_time_sub(end, start), FID_P(path));
 
 	return M0_RC(rc);
 }
