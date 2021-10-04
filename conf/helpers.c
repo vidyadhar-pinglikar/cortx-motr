@@ -205,8 +205,8 @@ M0_INTERNAL int m0_conf_full_load(struct m0_conf_root *r)
 
 	end = m0_time_now();
 
-	M0_LOG(M0_ALWAYS,"start=%"PRIu64" end=%"PRIu64" diff=%"PRIu64" fid="FID_F,
-		start, end, m0_time_sub(end, start), FID_P(path));
+	M0_LOG(M0_ALWAYS,"start=%"PRIu64" end=%"PRIu64" diff=%"PRIu64,
+		start, end, m0_time_sub(end, start));
 
 	return M0_RC(rc);
 }
