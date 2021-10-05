@@ -629,8 +629,8 @@ M0_INTERNAL int m0_conf_confc_ha_update_async(struct m0_confc *confc,
 	int32_t               total;
 	int                   rc;
 	int                   i = 0;
-	m0time_t              start = m0_time_now();
-	m0time_t              end;
+	m0_time_t              start = m0_time_now();
+	m0_time_t              end;
 
 	total = m0_tl_reduce(m0_conf_cache, obj, &cache->ca_registry, 0,
 	                     + (m0_fid_tget(&obj->co_id) ==
