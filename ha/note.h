@@ -209,7 +209,7 @@ struct m0_ha_state_single {
 };
 
 enum m0_ha_state_update_defaults {
-	M0_HA_STATE_UPDATE_LIMIT = 1024,
+	M0_HA_STATE_UPDATE_LIMIT = 256, /*1024,*/
 };
 
 enum {
