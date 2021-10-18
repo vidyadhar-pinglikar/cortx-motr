@@ -52,6 +52,7 @@ enum m0_dtm0s_msg {
 struct dtm0_req_fop {
 	uint32_t               dtr_msg M0_XCA_FENUM(m0_dtm0s_msg);
 	struct m0_dtm0_tx_desc dtr_txr;
+	struct m0_buf          dtr_payload;
 } M0_XCA_RECORD M0_XCA_DOMAIN(rpc);
 
 struct dtm0_rep_fop {
