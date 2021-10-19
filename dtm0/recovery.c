@@ -817,48 +817,50 @@ enum {
 };
 
 struct recovery_fom {
-	struct m0_fom        rf_base;
+	struct m0_fom                    rf_base;
 
 	/* Recovery machine instance that owns this FOM. */
 	struct m0_dtm0_recovery_machine *rf_m;
 
 	/** Subscription to conf obj HA state. */
-	struct m0_clink      rf_ha_clink;
+	struct m0_clink                  rf_ha_clink;
 
 	/** HA event queue populated by the clink and consumed by the FOM. */
-	struct m0_be_queue   rf_heq;
+	struct m0_be_queue               rf_heq;
 
-	struct m0_co_context rf_coro;
+	struct m0_co_context             rf_coro;
 
 	/** Linkage for m0_dtm0_recovery_machine::rm_foms */
-	struct m0_tlink      rf_linkage;
+	struct m0_tlink                  rf_linkage;
 
 	/** Magic for rfom tlist entry. */
-	uint64_t             rf_magic;
+	uint64_t                         rf_magic;
 
-	struct m0_be_queue   rf_eolq;
+	struct m0_be_queue               rf_eolq;
+
+	struct m0_be_dtm0_log_iter       rf_log_iter;
 
 	/* Target DTM0 service FID (id of this FOM within the machine). */
-	struct m0_fid        rf_tgt_svc;
+	struct m0_fid                    rf_tgt_svc;
 
-	struct m0_fid        rf_tgt_proc;
+	struct m0_fid                    rf_tgt_proc;
 
 	/** Is target DTM0 service the service ::rf_m belongs to? */
-	bool                 rf_is_local;
+	bool                             rf_is_local;
 
 	/** Is target DTM0 volatile? */
-	bool                 rf_is_volatile;
+	bool                            rf_is_volatile;
 
 
 	/** The most recent HA state of this remote DTM0 service. */
-	enum m0_ha_obj_state rf_last_known_ha_state;
+	enum m0_ha_obj_state            rf_last_known_ha_state;
 
 	/**
 	 * The most recent known state of the log on a remote DTM0 service.
 	 * Note, it is impossible to guarantee that this stat is "in-sync"
 	 * with ::rf_last_known_ha_state unless we have HA epochs.
 	 */
-	bool                 rf_last_known_eol;
+	bool                            rf_last_known_eol;
 };
 
 enum eolq_item_type {
@@ -892,6 +894,8 @@ static void recovery_machine_unlock(struct m0_dtm0_recovery_machine *m);
 static struct recovery_fom *
 recovery_fom_local(struct m0_dtm0_recovery_machine *m);
 
+static const struct m0_dtm0_recovery_machine_ops default_ops;
+
 static bool ha_event_invariant(uint64_t event)
 {
 	return event < M0_NC_NR;
@@ -916,6 +920,20 @@ const static struct m0_sm_conf recovery_machine_conf = {
 	.scf_state     = recovery_machine_states,
 };
 
+static void ops_apply(struct m0_dtm0_recovery_machine_ops *out,
+		      const struct m0_dtm0_recovery_machine_ops *def,
+		      const struct m0_dtm0_recovery_machine_ops *over)
+{
+#define OVERWRITE_IF_SET(op) \
+	out->op = over->op != NULL ? over->op : def->op; \
+	M0_ASSERT_INFO(out->op != NULL, "Op %s is not set", #op)
+	OVERWRITE_IF_SET(log_iter_init);
+	OVERWRITE_IF_SET(log_iter_fini);
+	OVERWRITE_IF_SET(log_iter_next);
+	OVERWRITE_IF_SET(redo_post);
+	OVERWRITE_IF_SET(ha_event_post);
+#undef OVERWRITE_IF_SET
+}
 
 M0_INTERNAL int
 m0_dtm0_recovery_machine_init(struct m0_dtm0_recovery_machine           *m,
@@ -927,7 +945,7 @@ m0_dtm0_recovery_machine_init(struct m0_dtm0_recovery_machine           *m,
 
 	mod_init();
 	m->rm_svc = svc;
-	m->rm_ops = ops;
+	ops_apply(&m->rm_ops, &default_ops, ops);
 	rfom_tlist_init(&m->rm_rfoms);
 	m0_sm_group_init(&m->rm_sm_group);
 	m0_sm_init(&m->rm_sm, &recovery_machine_conf,
@@ -992,13 +1010,29 @@ recovery_machine_local_id(const struct m0_dtm0_recovery_machine *m)
 	return &m->rm_svc->dos_generic.rs_service_fid;
 }
 
-static int recovery_machine_log_next_get(struct m0_dtm0_recovery_machine *m,
-					 const struct m0_fid *tgt_svc,
-					 const struct m0_fid *origin_svc,
-					 struct m0_dtm0_log_rec *record)
+static int recovery_machine_log_iter_next(struct m0_dtm0_recovery_machine *m,
+					  struct m0_be_dtm0_log_iter *iter,
+					  const struct m0_fid *tgt_svc,
+					  const struct m0_fid *origin_svc,
+					  struct m0_dtm0_log_rec *record)
 {
-	M0_PRE(m->rm_ops->log_iter_next != NULL);
-	return m->rm_ops->log_iter_next(m, NULL, tgt_svc, origin_svc, record);
+	M0_PRE(m->rm_ops.log_iter_next != NULL);
+	return m->rm_ops.log_iter_next(m, iter, tgt_svc, origin_svc, record);
+}
+
+static int recovery_machine_log_iter_init(struct m0_dtm0_recovery_machine *m,
+					  struct m0_be_dtm0_log_iter      *iter)
+{
+	M0_PRE(m->rm_ops.log_iter_init != NULL);
+	return m->rm_ops.log_iter_init(m, iter);
+
+}
+
+static void recovery_machine_log_iter_fini(struct m0_dtm0_recovery_machine *m,
+					   struct m0_be_dtm0_log_iter      *iter)
+{
+	M0_PRE(m->rm_ops.log_iter_fini != NULL);
+	m->rm_ops.log_iter_fini(m, iter);
 }
 
 static void recovery_machine_redo_post(struct m0_dtm0_recovery_machine *m,
@@ -1007,17 +1041,17 @@ static void recovery_machine_redo_post(struct m0_dtm0_recovery_machine *m,
 				       struct dtm0_req_fop *redo,
 				       struct m0_be_op *op)
 {
-	M0_PRE(m->rm_ops->redo_post != NULL);
-	m->rm_ops->redo_post(m, tgt_proc, tgt_svc, redo, op);
+	M0_PRE(m->rm_ops.redo_post != NULL);
+	m->rm_ops.redo_post(m, tgt_proc, tgt_svc, redo, op);
 }
 
 static void recovery_machine_recovered(struct m0_dtm0_recovery_machine *m,
 				       const struct m0_fid *tgt_proc,
 				       const struct m0_fid *tgt_svc)
 {
-	M0_PRE(m->rm_ops->ha_event_post != NULL);
-	m->rm_ops->ha_event_post(m, tgt_proc, tgt_svc,
-				 M0_CONF_HA_PROCESS_DTM_RECOVERED);
+	M0_PRE(m->rm_ops.ha_event_post != NULL);
+	m->rm_ops.ha_event_post(m, tgt_proc, tgt_svc,
+				M0_CONF_HA_PROCESS_DTM_RECOVERED);
 }
 
 static void recovery_machine_lock(struct m0_dtm0_recovery_machine *m)
@@ -1443,15 +1477,18 @@ static void restore(struct m0_fom *fom,
 		      struct m0_fid       initiator;
 		      );
 
+	recovery_machine_log_iter_init(rf->rf_m, &rf->rf_log_iter);
+
 	/* XXX: race condition in the case where we are stopping the FOM. */
 	F(initiator) = recovery_fom_local(rf->rf_m)->rf_tgt_svc;
 
 	do {
 		M0_SET0(&record);
-		rc = recovery_machine_log_next_get(rf->rf_m, &rf->rf_tgt_svc,
-						   NULL, &record);
-		M0_ASSERT(M0_IN(rc, (0, -ENOENT)));
-		flags = (rc == -ENOENT) ? M0_BITS(M0_DMF_EOL) : 0;
+		rc = recovery_machine_log_iter_next(rf->rf_m, &rf->rf_log_iter,
+						    &rf->rf_tgt_svc, NULL,
+						    &record);
+		/* Any value except zero means that we should stop recovery. */
+		flags = rc == 0 ? 0 : M0_BITS(M0_DMF_EOL);
 		F(redo) = (struct dtm0_req_fop) {
 			.dtr_msg       = DTM_REDO,
 			.dtr_initiator = F(initiator),
@@ -1462,6 +1499,9 @@ static void restore(struct m0_fom *fom,
 		recovery_machine_redo_post(rf->rf_m, &rf->rf_tgt_proc,
 					   &rf->rf_tgt_svc, &F(redo), NULL);
 	} while (rc == 0);
+
+	recovery_machine_log_iter_fini(rf->rf_m, &rf->rf_log_iter);
+	M0_SET0(&rf->rf_log_iter);
 
 	M0_CO_FUN(CO(fom), heq_await(fom, out, eoq));
 }
@@ -1686,15 +1726,84 @@ m0_dtm0_recovery_machine_redo_post(struct m0_dtm0_recovery_machine *m,
 			       "REDO received but svc is not RECOVERING yet");
 			m0_be_op_active(op);
 			m0_be_op_done(op);
-			M0_ASSERT(false);
 		}
 	} else {
 		M0_LOG(M0_DEBUG, "A non-EOL REDO was ignored.");
 		m0_be_op_active(op);
 		m0_be_op_done(op);
-		M0_ASSERT(false);
 	}
 }
+
+static int default_log_iter_init(struct m0_dtm0_recovery_machine *m,
+				 struct m0_be_dtm0_log_iter      *iter)
+{
+	m0_be_dtm0_log_iter_init(iter, m->rm_svc->dos_log);
+	return 0;
+}
+
+static void default_log_iter_fini(struct m0_dtm0_recovery_machine *m,
+				  struct m0_be_dtm0_log_iter      *iter)
+{
+	struct recovery_fom *rf = M0_AMB(rf, iter, rf_log_iter);
+	M0_ASSERT(rf->rf_m == m);
+	m0_be_dtm0_log_iter_fini(iter);
+}
+
+static bool participated(const struct m0_dtm0_log_rec *record,
+			 const struct m0_fid          *svc)
+{
+	return m0_exists(i, record->dlr_txd.dtd_ps.dtp_nr,
+			 m0_fid_eq(&record->dlr_txd.dtd_ps.dtp_pa[i].p_fid,
+				   svc));
+}
+
+static int default_log_iter_next(struct m0_dtm0_recovery_machine *m,
+				 struct m0_be_dtm0_log_iter      *iter,
+				 const struct m0_fid             *tgt_svc,
+				 const struct m0_fid             *origin_svc,
+				 struct m0_dtm0_log_rec          *record)
+{
+	struct m0_be_dtm0_log *log = m->rm_svc->dos_log;
+	int rc;
+
+	/* XXX: not supported yet */
+	M0_ASSERT(origin_svc == NULL);
+
+	m0_mutex_lock(&log->dl_lock);
+
+	/* Filter out records where tgt_svc is not a participant. */
+	do {
+		M0_SET0(record);
+		rc = m0_be_dtm0_log_iter_next(iter, record);
+		if (rc == +1) {
+			if (participated(record, tgt_svc))
+				break;
+			else
+				m0_dtm0_log_iter_rec_fini(record);
+		}
+	} while (rc == +1);
+
+	m0_mutex_unlock(&log->dl_lock);
+
+	/* XXX: error codes will be adjusted separately. */
+	switch (rc) {
+	case +1:
+		return 0;
+	case 0:
+		return -ENOENT;
+	default:
+		return M0_ERR(rc);
+	}
+}
+
+static const struct m0_dtm0_recovery_machine_ops default_ops = {
+	.log_iter_init = default_log_iter_init,
+	.log_iter_fini = default_log_iter_fini,
+	.log_iter_next = default_log_iter_next,
+
+	.redo_post     = NULL, /* Not implemented yet */
+	.ha_event_post = NULL, /* Not implemented yet */
+};
 
 #undef M0_TRACE_SUBSYSTEM
 /*

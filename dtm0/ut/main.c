@@ -313,7 +313,11 @@ enum ut_sides {
 	UT_SIDE_NR
 };
 
+struct m0_fid g_service_fids[UT_SIDE_NR];
+
 struct ut_remach {
+	bool                             use_real_log;
+
 	struct m0_rpc_server_ctx         srv_ctx;
 	struct cl_ctx                    cli_ctx;
 
@@ -337,44 +341,179 @@ struct ha_thought {
 	.who = _who, .what = _what                    \
 }
 
-static void um_redo_post(struct m0_dtm0_recovery_machine *m,
-			 const struct m0_fid *tgt_proc,
-			 const struct m0_fid *tgt_svc,
-			 struct dtm0_req_fop *redo,
-			 struct m0_be_op *op)
+static struct m0_dtm0_recovery_machine *ut_remach_get(struct ut_remach *um,
+						      enum ut_sides side)
+{
+	struct m0_dtm0_recovery_machine *ms[UT_SIDE_NR] = {
+		[UT_SIDE_SRV] = &um->srv_mach,
+		[UT_SIDE_CLI] = &um->cli_mach,
+	};
+	M0_UT_ASSERT(side < UT_SIDE_NR);
+	return ms[side];
+}
+
+static const struct m0_fid *ut_remach_fid_get(enum ut_sides side)
+{
+	M0_UT_ASSERT(side < UT_SIDE_NR);
+	return &g_service_fids[side];
+}
+
+static enum ut_sides ut_remach_side_get(const struct m0_fid *svc)
+{
+	enum ut_sides side;
+
+	for (side = 0; side < UT_SIDE_NR; ++side) {
+		if (m0_fid_eq(ut_remach_fid_get(side), svc))
+			break;
+	}
+
+	M0_UT_ASSERT(side < UT_SIDE_NR);
+	return side;
+}
+
+static struct ut_remach *ut_remach_from(struct m0_dtm0_recovery_machine *m,
+					const struct m0_fid *svc)
+{
+	struct ut_remach *um = NULL;
+
+	if (m0_fid_eq(ut_remach_fid_get(UT_SIDE_SRV), svc)) {
+		um = M0_AMB(um, m, srv_mach);
+	} else if (m0_fid_eq(ut_remach_fid_get(UT_SIDE_CLI), svc)) {
+		um = M0_AMB(um, m, cli_mach);
+	}
+
+	M0_UT_ASSERT(um != NULL);
+	return um;
+}
+
+static void ut_remach_log_add_sync(struct ut_remach *um,
+				   enum ut_sides side,
+				   struct m0_dtm0_tx_desc *txd,
+				   struct m0_buf *payload)
+{
+	struct m0_dtm0_recovery_machine *m = ut_remach_get(um, side);
+	struct m0_dtm0_service *svc = m->rm_svc;
+	struct m0_be_dtm0_log *log = svc->dos_log;
+	struct m0_be_tx       *tx = NULL;
+	struct m0_be_seg      *seg = log->dl_seg;
+	struct m0_be_tx_credit cred = {};
+	struct m0_be_ut_backend *ut_be;
+	int rc;
+
+	if (log->dl_is_persistent) {
+		M0_UT_ASSERT(svc->dos_generic.rs_reqh_ctx != NULL);
+		ut_be = &svc->dos_generic.rs_reqh_ctx->rc_be;
+		m0_be_dtm0_log_credit(M0_DTML_EXECUTED, txd, payload, seg,
+				      NULL, &cred);
+		M0_ALLOC_PTR(tx);
+		M0_UT_ASSERT(tx != NULL);
+		m0_be_ut_tx_init(tx, ut_be);
+		m0_be_tx_prep(tx, &cred);
+		rc = m0_be_tx_open_sync(tx);
+		M0_UT_ASSERT(rc == 0);
+	}
+
+	m0_mutex_lock(&log->dl_lock);
+	rc = m0_be_dtm0_log_update(log, tx, txd, payload);
+	M0_UT_ASSERT(rc == 0);
+	m0_mutex_unlock(&log->dl_lock);
+
+	if (log->dl_is_persistent) {
+		m0_be_tx_close_sync(tx);
+		m0_be_tx_fini(tx);
+		m0_free(tx);
+	}
+}
+
+
+static void um_dummy_log_redo_post(struct m0_dtm0_recovery_machine *m,
+				   const struct m0_fid *tgt_proc,
+				   const struct m0_fid *tgt_svc,
+				   struct dtm0_req_fop *redo,
+				   struct m0_be_op *op)
 {
 	struct ut_remach   *um = NULL;
 	struct m0_dtm0_recovery_machine *counterpart = NULL;
 
-	const struct m0_fid svcs[UT_SIDE_NR] = {
-		[UT_SIDE_SRV] = srv_dtm0_fid,
-		[UT_SIDE_CLI] = cli_srv_fid,
-	};
-
-	/* Select the counterpart using the service fid. */
-	if (m0_fid_eq(&svcs[UT_SIDE_SRV], tgt_svc)) {
-		um = M0_AMB(um, m, cli_mach);
-		counterpart = &um->srv_mach;
-	} else if (m0_fid_eq(&svcs[UT_SIDE_CLI], tgt_svc)) {
-		um = M0_AMB(um, m, srv_mach);
-		counterpart = &um->cli_mach;
-	}
-
-	M0_UT_ASSERT(um != NULL);
-	M0_UT_ASSERT(counterpart != NULL);
-
+	um = ut_remach_from(m, &redo->dtr_initiator);
+	counterpart = ut_remach_get(um, ut_remach_side_get(tgt_svc));
 	M0_BE_OP_SYNC(op, m0_dtm0_recovery_machine_redo_post(counterpart,
 							     redo, &op));
 }
 
-static int um_log_next_get(struct m0_dtm0_recovery_machine *m,
-			   struct m0_be_dtm0_log_iter *iter,
-			   const struct m0_fid *tgt_svc,
-			   const struct m0_fid *origin_svc,
-			   struct m0_dtm0_log_rec *record)
+static void um_real_log_redo_post(struct m0_dtm0_recovery_machine *m,
+				  const struct m0_fid *tgt_proc,
+				  const struct m0_fid *tgt_svc,
+				  struct dtm0_req_fop *redo,
+				  struct m0_be_op *op)
+{
+	struct ut_remach   *um = NULL;
+	struct m0_dtm0_recovery_machine *counterpart = NULL;
+	enum ut_sides tgt_side = ut_remach_side_get(tgt_svc);
+	struct m0_dtm0_service *svc;
+	struct m0_be_ut_backend *ut_be;
+
+	M0_UT_ASSERT(op == NULL); /* Not supported yet */
+
+	um = ut_remach_from(m, &redo->dtr_initiator);
+	counterpart = ut_remach_get(um, tgt_side);
+
+	/* Empty REDOs are allowed only when EOL is set. */
+	M0_UT_ASSERT(ergo(m0_dtm0_tx_desc_is_none(&redo->dtr_txr),
+			  !!(redo->dtr_flags & M0_BITS(M0_DMF_EOL))));
+
+	/* Emulate REDO FOM: update the log */
+	if (!m0_dtm0_tx_desc_is_none(&redo->dtr_txr))
+		ut_remach_log_add_sync(um, tgt_side, &redo->dtr_txr,
+				       &redo->dtr_payload);
+
+	M0_BE_OP_SYNC(op, m0_dtm0_recovery_machine_redo_post(counterpart,
+							     redo, &op));
+
+	/*
+	 * It is a sordid but simple way of making ::ut_remach_log_add_sync
+	 * work:
+	 * RPC client does not have a fully-funcitonal context, so that
+	 * sm-based BE logic cannot progress because there is no BE associated
+	 * with the corresponding FOM (fom -> reqh -> context -> be).
+	 * However, both sides share the same set of localities,
+	 * so that we can sit down right here and wait until everything
+	 * is completed.
+	 * It might be slow and dangerous but it is enough for a simple test.
+	 */
+	if (!m0_dtm0_tx_desc_is_none(&redo->dtr_txr) &&
+	    tgt_side == UT_SIDE_SRV) {
+		svc = counterpart->rm_svc;
+		ut_be = &svc->dos_generic.rs_reqh_ctx->rc_be;
+		m0_be_ut_backend_sm_group_asts_run(ut_be);
+		m0_be_ut_backend_thread_exit(ut_be);
+	}
+}
+
+static int um_dummy_log_iter_next(struct m0_dtm0_recovery_machine *m,
+				  struct m0_be_dtm0_log_iter *iter,
+				  const struct m0_fid *tgt_svc,
+				  const struct m0_fid *origin_svc,
+				  struct m0_dtm0_log_rec *record)
 {
 	M0_SET0(record);
 	return -ENOENT;
+}
+
+static int um_dummy_log_iter_init(struct m0_dtm0_recovery_machine *m,
+				  struct m0_be_dtm0_log_iter *iter)
+{
+	(void) m;
+	(void) iter;
+	return 0;
+}
+
+static void um_dummy_log_iter_fini(struct m0_dtm0_recovery_machine *m,
+				   struct m0_be_dtm0_log_iter *iter)
+{
+	(void) m;
+	(void) iter;
+	/* nothing to do */
 }
 
 void um_ha_event_post(struct m0_dtm0_recovery_machine *m,
@@ -408,11 +547,25 @@ void um_ha_event_post(struct m0_dtm0_recovery_machine *m,
 	}
 }
 
-const struct m0_dtm0_recovery_machine_ops um_ops = {
-	.redo_post     = um_redo_post,
-	.log_iter_next  = um_log_next_get,
-	.ha_event_post = um_ha_event_post,
+const struct m0_dtm0_recovery_machine_ops um_with_dummy_log_ops = {
+	.log_iter_next  = um_dummy_log_iter_next,
+	.log_iter_init  = um_dummy_log_iter_init,
+	.log_iter_fini  = um_dummy_log_iter_fini,
+
+	.redo_post      = um_dummy_log_redo_post,
+	.ha_event_post  = um_ha_event_post,
 };
+
+const struct m0_dtm0_recovery_machine_ops um_with_real_log_ops = {
+	/* Use default ops when we need to deal with real DTM0 log. */
+	.log_iter_next  = NULL,
+	.log_iter_init  = NULL,
+	.log_iter_fini  = NULL,
+
+	.redo_post      = um_real_log_redo_post,
+	.ha_event_post  = um_ha_event_post,
+};
+
 
 /*
  * Unicast an HA thought to a particular side.
@@ -421,16 +574,8 @@ static void ut_remach_ha_tells(struct ut_remach *um,
 			       const struct ha_thought *t,
 			       enum ut_sides     whom)
 {
-	const struct m0_fid           svcs[UT_SIDE_NR] = {
-		[UT_SIDE_SRV] = srv_dtm0_fid,
-		[UT_SIDE_CLI] = cli_srv_fid,
-	};
-	struct m0_dtm0_recovery_machine *ms[UT_SIDE_NR] = {
-		[UT_SIDE_SRV] = &um->srv_mach,
-		[UT_SIDE_CLI] = &um->cli_mach,
-	};
-
-	m0_ut_remach_heq_post(ms[whom], &svcs[t->who], t->what);
+	m0_ut_remach_heq_post(ut_remach_get(um, whom),
+			      ut_remach_fid_get(t->who), t->what);
 }
 
 /*
@@ -439,14 +584,18 @@ static void ut_remach_ha_tells(struct ut_remach *um,
 static void ut_remach_ha_thinks(struct ut_remach        *um,
 				const struct ha_thought *t)
 {
-	const struct m0_fid           svcs[UT_SIDE_NR] = {
-		[UT_SIDE_SRV] = srv_dtm0_fid,
-		[UT_SIDE_CLI] = cli_srv_fid,
-	};
-	int                           side;
+	enum ut_sides side;
 
-	for (side = 0; side < ARRAY_SIZE(svcs); ++side)
+	for (side = 0; side < UT_SIDE_NR; ++side)
 		ut_remach_ha_tells(um, t, side);
+}
+
+static const struct m0_dtm0_recovery_machine_ops*
+ut_remach_ops_get(struct ut_remach *um)
+{
+	return um->use_real_log ?
+		&um_with_real_log_ops :
+		&um_with_dummy_log_ops;
 }
 
 static void ut_srv_remach_init(struct ut_remach *um)
@@ -474,7 +623,9 @@ static void ut_srv_remach_init(struct ut_remach *um)
 	M0_UT_ASSERT(srv_svc != NULL);
 	um->srv_svc = M0_AMB(um->srv_svc, srv_svc, dos_generic);
 
-	rc = m0_dtm0_recovery_machine_init(&um->srv_mach, &um_ops, um->srv_svc);
+	rc = m0_dtm0_recovery_machine_init(&um->srv_mach,
+					   ut_remach_ops_get(um),
+					   um->srv_svc);
 	M0_UT_ASSERT(rc == 0);
 }
 
@@ -527,7 +678,9 @@ static void ut_cli_remach_init(struct ut_remach *um)
 
 	um->cli_svc = M0_AMB(um->cli_svc, cli_svc, dos_generic);
 
-	rc = m0_dtm0_recovery_machine_init(&um->cli_mach, &um_ops, um->cli_svc);
+	rc = m0_dtm0_recovery_machine_init(&um->cli_mach,
+					   ut_remach_ops_get(um),
+					   um->cli_svc);
 	M0_UT_ASSERT(rc == 0);
 	m0_ut_remach_populate(&um->cli_mach, um->cli_procs, svcs, is_volatile,
 			      UT_SIDE_NR);
@@ -573,6 +726,9 @@ static void ut_remach_init(struct ut_remach *um)
 {
 	int i;
 
+	g_service_fids[UT_SIDE_SRV] = srv_dtm0_fid;
+	g_service_fids[UT_SIDE_CLI] = cli_srv_fid;
+
 	for (i = 0; i < ARRAY_SIZE(um->recovered); ++i) {
 		m0_be_op_init(um->recovered + i);
 		m0_be_op_active(um->recovered + i);
@@ -592,6 +748,8 @@ static void ut_remach_fini(struct ut_remach *um)
 			m0_be_op_done(um->recovered + i);
 		m0_be_op_fini(um->recovered + i);
 	}
+
+	M0_SET_ARR0(g_service_fids);
 }
 
 static void ut_remach_reset_srv(struct ut_remach *um)
@@ -600,11 +758,100 @@ static void ut_remach_reset_srv(struct ut_remach *um)
 
 	m0_dtm0_recovery_machine_stop(&um->srv_mach);
 	m0_dtm0_recovery_machine_fini(&um->srv_mach);
-	rc = m0_dtm0_recovery_machine_init(&um->srv_mach, &um_ops, um->srv_svc);
+	rc = m0_dtm0_recovery_machine_init(&um->srv_mach,
+					   ut_remach_ops_get(um),
+					   um->srv_svc);
 	M0_UT_ASSERT(rc == 0);
 	m0_dtm0_recovery_machine_start(&um->srv_mach);
 }
 
+static void ut_remach_log_gen_sync(struct ut_remach *um,
+				   enum ut_sides side,
+				   uint64_t ts_start,
+				   uint64_t records_nr)
+{
+	struct m0_dtm0_tx_desc           txd = {};
+	struct m0_buf                    payload = {};
+	int                              rc;
+	int                              i;
+
+	rc = m0_dtm0_tx_desc_init(&txd, 1);
+	M0_UT_ASSERT(rc == 0);
+	txd.dtd_ps.dtp_pa[0] = (struct m0_dtm0_tx_pa) {
+		.p_state = M0_DTPS_EXECUTED,
+		.p_fid = *ut_remach_fid_get(UT_SIDE_SRV),
+	};
+	txd.dtd_id = (struct m0_dtm0_tid) {
+		.dti_ts.dts_phys = 0,
+		.dti_fid = *ut_remach_fid_get(UT_SIDE_CLI),
+	};
+
+	for (i = 0; i < records_nr; ++i) {
+		txd.dtd_id.dti_ts.dts_phys = ts_start + i;
+		ut_remach_log_add_sync(um, side, &txd, &payload);
+	}
+
+	m0_dtm0_tx_desc_fini(&txd);
+}
+
+/*
+ * Ensures that DTM0 log A is a subset of DTM0 log B; and,
+ * optionally, that A has at exactly "expected_records_nr" log records
+ * (if expected_records_nr < 0 then this check is omitted).
+ * Note, pairs (tid, payload) are used as comarison keys. The states
+ * of participants and the other fields are ignored.
+ */
+static void log_subset_verify(struct ut_remach *um,
+			      int               expected_records_nr,
+			      enum ut_sides     a_side,
+			      enum ut_sides     b_side)
+{
+	struct m0_be_dtm0_log     *a_log =
+		ut_remach_get(um, a_side)->rm_svc->dos_log;
+	struct m0_be_dtm0_log     *b_log =
+		ut_remach_get(um, b_side)->rm_svc->dos_log;
+	struct m0_be_dtm0_log_iter a_iter;
+	struct m0_dtm0_log_rec     a_record;
+	struct m0_dtm0_log_rec    *b_record;
+	struct m0_buf             *a_buf;
+	struct m0_buf             *b_buf;
+	struct m0_dtm0_tid        *tid;
+	int                        rc;
+	bool                       has_next = true;
+	uint64_t                   actual_records_nr = 0;
+
+	m0_mutex_lock(&a_log->dl_lock);
+	m0_mutex_lock(&b_log->dl_lock);
+
+	m0_be_dtm0_log_iter_init(&a_iter, a_log);
+
+	while (has_next) {
+		rc = m0_be_dtm0_log_iter_next(&a_iter, &a_record);
+		M0_UT_ASSERT(rc >= 0);
+		has_next = rc > 0;
+		if (has_next) {
+			tid = &a_record.dlr_txd.dtd_id;
+			b_record = m0_be_dtm0_log_find(b_log, tid);
+			M0_UT_ASSERT(b_record != NULL);
+			a_buf = &a_record.dlr_payload;
+			b_buf = &b_record->dlr_payload;
+			M0_UT_ASSERT(equi(m0_buf_is_set(a_buf),
+					   m0_buf_is_set(b_buf)));
+			M0_UT_ASSERT(ergo(m0_buf_is_set(a_buf),
+					  m0_buf_eq(a_buf, b_buf)));
+			m0_dtm0_log_iter_rec_fini(&a_record);
+			actual_records_nr++;
+		}
+	}
+
+	M0_UT_ASSERT(ergo(expected_records_nr >= 0,
+			  expected_records_nr == actual_records_nr));
+
+	m0_mutex_unlock(&b_log->dl_lock);
+	m0_mutex_unlock(&a_log->dl_lock);
+}
+
+/* Case: Ensure the machine initialised properly. */
 static void remach_init_fini(void)
 {
 	struct ut_remach um = {};
@@ -612,6 +859,7 @@ static void remach_init_fini(void)
 	ut_remach_fini(&um);
 }
 
+/* Case: Ensure the machine is able to start/stop. */
 static void remach_start_stop(void)
 {
 	struct ut_remach um = {};
@@ -657,6 +905,7 @@ static void ut_remach_shutdown(struct ut_remach *um)
 	ut_remach_fini(um);
 }
 
+/* Use-case: gracefull boot and shutdown of 2-node cluster. */
 static void remach_boot_cluster(void)
 {
 	struct ut_remach um = {};
@@ -665,6 +914,7 @@ static void remach_boot_cluster(void)
 	ut_remach_shutdown(&um);
 }
 
+/* Use-case: re-boot an ONLINE node. */
 static void remach_reboot_server(void)
 {
 	struct ut_remach um = {};
@@ -678,13 +928,15 @@ static void remach_reboot_server(void)
 	ut_remach_ha_thinks(&um, &HA_THOUGHT(UT_SIDE_SRV, M0_NC_TRANSIENT));
 	ut_remach_ha_tells(&um, &HA_THOUGHT(UT_SIDE_CLI, M0_NC_ONLINE),
 			   UT_SIDE_SRV);
-	ut_remach_ha_thinks(&um, &HA_THOUGHT(UT_SIDE_SRV, M0_NC_DTM_RECOVERING));
+	ut_remach_ha_thinks(&um, &HA_THOUGHT(UT_SIDE_SRV,
+					     M0_NC_DTM_RECOVERING));
 	m0_be_op_wait(um.recovered + UT_SIDE_SRV);
 	ut_remach_ha_thinks(&um, &HA_THOUGHT(UT_SIDE_SRV, M0_NC_ONLINE));
 
 	ut_remach_shutdown(&um);
 }
 
+/* Use-case: reboot a node when it started to recover. */
 static void remach_reboot_twice(void)
 {
 	struct ut_remach um = {};
@@ -713,8 +965,45 @@ static void remach_reboot_twice(void)
 	ut_remach_ha_thinks(&um, &HA_THOUGHT(UT_SIDE_SRV, M0_NC_TRANSIENT));
 	ut_remach_ha_tells(&um, &HA_THOUGHT(UT_SIDE_CLI, M0_NC_ONLINE),
 			   UT_SIDE_SRV);
-	ut_remach_ha_thinks(&um, &HA_THOUGHT(UT_SIDE_SRV, M0_NC_DTM_RECOVERING));
+	ut_remach_ha_thinks(&um, &HA_THOUGHT(UT_SIDE_SRV,
+					     M0_NC_DTM_RECOVERING));
 	m0_be_op_wait(um.recovered + UT_SIDE_SRV);
+	ut_remach_ha_thinks(&um, &HA_THOUGHT(UT_SIDE_SRV, M0_NC_ONLINE));
+
+	ut_remach_shutdown(&um);
+}
+
+/* Use-case: replay an empty DTM0 log. */
+static void remach_boot_real_log(void)
+{
+	struct ut_remach um = { .use_real_log = true };
+	ut_remach_boot(&um);
+	ut_remach_shutdown(&um);
+}
+
+/* Use-case: replay a non-empty client log to the server. */
+static void remach_real_log_replay(void)
+{
+	struct ut_remach um = { .use_real_log = true };
+	/* cafe bell */
+	const uint64_t since = 0xCAFEBELL;
+	const uint64_t records_nr = 10;
+
+	ut_remach_boot(&um);
+
+	ut_remach_log_gen_sync(&um, UT_SIDE_CLI, since, records_nr);
+
+	m0_be_op_reset(um.recovered + UT_SIDE_SRV);
+	m0_be_op_active(um.recovered + UT_SIDE_SRV);
+	ut_remach_reset_srv(&um);
+
+	ut_remach_ha_thinks(&um, &HA_THOUGHT(UT_SIDE_SRV, M0_NC_TRANSIENT));
+	ut_remach_ha_tells(&um, &HA_THOUGHT(UT_SIDE_CLI, M0_NC_ONLINE),
+			   UT_SIDE_SRV);
+	ut_remach_ha_thinks(&um, &HA_THOUGHT(UT_SIDE_SRV,
+					     M0_NC_DTM_RECOVERING));
+	m0_be_op_wait(um.recovered + UT_SIDE_SRV);
+	log_subset_verify(&um, records_nr, UT_SIDE_CLI, UT_SIDE_SRV);
 	ut_remach_ha_thinks(&um, &HA_THOUGHT(UT_SIDE_SRV, M0_NC_ONLINE));
 
 	ut_remach_shutdown(&um);
@@ -723,12 +1012,14 @@ static void remach_reboot_twice(void)
 struct m0_ut_suite dtm0_ut = {
 	.ts_name = "dtm0-ut",
 	.ts_tests = {
-		{ "xcode",                 cas_xcode_test        },
-		{ "remach-init-fini",      remach_init_fini      },
-		{ "remach-start-stop",     remach_start_stop     },
-		{ "remach-boot-cluster",   remach_boot_cluster   },
-		{ "remach-reboot-server",  remach_reboot_server  },
-		{ "remach-reboot-twice",   remach_reboot_twice   },
+		{ "xcode",                  cas_xcode_test        },
+		{ "remach-init-fini",       remach_init_fini      },
+		{ "remach-start-stop",      remach_start_stop     },
+		{ "remach-boot-cluster",    remach_boot_cluster   },
+		{ "remach-reboot-server",   remach_reboot_server  },
+		{ "remach-reboot-twice",    remach_reboot_twice   },
+		{ "remach-boot-real-log",   remach_boot_real_log  },
+		{ "remach-real-log-replay", remach_real_log_replay  },
 		{ NULL, NULL },
 	}
 };

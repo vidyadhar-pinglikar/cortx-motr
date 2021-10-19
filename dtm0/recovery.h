@@ -43,6 +43,7 @@ struct m0_dtm0_log_rec;
 
 /* exports */
 struct m0_dtm0_recovery_machine_ops;
+struct m0_dtm0_recovery_machine;
 struct recovery_fom;
 
 enum m0_dtm0_recovery_machine_states {
@@ -51,18 +52,7 @@ enum m0_dtm0_recovery_machine_states {
 	M0_DRMS_NR,
 };
 
-struct m0_dtm0_recovery_machine {
-	struct m0_dtm0_service                    *rm_svc;
-	struct m0_tl                               rm_rfoms;
-	const struct m0_dtm0_recovery_machine_ops *rm_ops;
-	struct recovery_fom                       *rm_local_rfom;
-
-	struct m0_sm_group                         rm_sm_group;
-	struct m0_sm                               rm_sm;
-};
-
 struct m0_dtm0_recovery_machine_ops {
-
 	/**
 	 * Post a REDO message to the target DTM0 service.
 	 */
@@ -71,6 +61,14 @@ struct m0_dtm0_recovery_machine_ops {
 			  const struct m0_fid             *tgt_svc,
 			  struct dtm0_req_fop             *redo,
 			  struct m0_be_op                 *op);
+
+	/**
+	 * Post a conf ha process event.
+	 */
+	void (*ha_event_post)(struct m0_dtm0_recovery_machine *m,
+			      const struct m0_fid             *tgt_proc,
+			      const struct m0_fid             *tgt_svc,
+			      enum m0_conf_ha_process_event    event);
 
 	int (*log_iter_init)(struct m0_dtm0_recovery_machine *m,
 			     struct m0_be_dtm0_log_iter      *iter);
@@ -90,17 +88,28 @@ struct m0_dtm0_recovery_machine_ops {
 			     const struct m0_fid               *origin_svc,
 			     struct m0_dtm0_log_rec            *record);
 
-	int (*log_iter_fini)(struct m0_be_dtm0_log_iter *iter);
-
-	/**
-	 * Post a conf ha process event.
-	 */
-	void (*ha_event_post)(struct m0_dtm0_recovery_machine *m,
-			      const struct m0_fid             *tgt_proc,
-			      const struct m0_fid             *tgt_svc,
-			      enum m0_conf_ha_process_event    event);
+	void (*log_iter_fini)(struct m0_dtm0_recovery_machine *m,
+			      struct m0_be_dtm0_log_iter      *iter);
 };
 
+
+struct m0_dtm0_recovery_machine {
+	struct m0_dtm0_service                    *rm_svc;
+	struct m0_tl                               rm_rfoms;
+	struct m0_dtm0_recovery_machine_ops        rm_ops;
+	struct recovery_fom                       *rm_local_rfom;
+
+	struct m0_sm_group                         rm_sm_group;
+	struct m0_sm                               rm_sm;
+};
+
+/**
+ * Initialise a recovery machine.
+ * @param ops Recovery machine operations (such as sending of REDOs and some
+ *            others) that have to be used instead of the default ops.
+ *            These ops may be used to alter the effects of recovery machine
+ *            decisions on the system (for example, in UTs).
+ */
 M0_INTERNAL int
 m0_dtm0_recovery_machine_init(struct m0_dtm0_recovery_machine           *m,
 			      const struct m0_dtm0_recovery_machine_ops *ops,
