@@ -28,7 +28,7 @@
 #include "lib/tlist.h" /* m0_tl */
 #include "ha/note.h"   /* m0_ha_obj_state */
 #include "conf/ha.h"   /* m0_conf_ha_process_event */
-#include "dtm0/fop.h"  /* dtm0_req_fop */
+#include "sm/sm.h"     /* m0_sm, m0_sm_group */
 
 /* TODO: figure good literals and it move to the satchel */
 #define M0_DTM0_RMACH_MAGIC 0x3AB0DBED
@@ -40,6 +40,8 @@ struct m0_conf_process;
 struct dtm0_req_fop;
 struct m0_be_dtm0_log_iter;
 struct m0_dtm0_log_rec;
+struct m0_be_op;
+struct m0_fom;
 
 /* exports */
 struct m0_dtm0_recovery_machine_ops;

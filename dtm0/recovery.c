@@ -790,6 +790,9 @@ Deviverables:
 #include "lib/trace.h"
 #include "dtm0/recovery.h"   /* m0_dtm0_recovery_machine */
 #include "dtm0/service.h"    /* m0_dtm0_service */
+#include "dtm0/drlink.h"     /* m0_dtm0_req_post */
+#include "dtm0/fop.h"        /* dtm0_req_fop */
+#include "be/op.h"           /* m0_be_op */
 #include "be/queue.h"        /* m0_be_queue */
 #include "conf/diter.h"      /* diter */
 #include "conf/helpers.h"    /* m0_confc_root_open */
@@ -802,7 +805,6 @@ Deviverables:
 #include "lib/string.h"      /* m0_streq */
 #include "be/dtm0_log.h"     /* m0_dtm0_log_rec */
 #include "motr/setup.h"      /* m0_cs_reqh_context */
-#include "dtm0/drlink.h"     /* m0_dtm0_req_post */
 
 enum {
 	/*
@@ -927,7 +929,7 @@ static void ops_apply(struct m0_dtm0_recovery_machine_ops *out,
 		      const struct m0_dtm0_recovery_machine_ops *over)
 {
 #define OVERWRITE_IF_SET(op) \
-	out->op = over->op != NULL ? over->op : def->op; \
+	out->op = over != NULL && over->op != NULL ? over->op : def->op; \
 	M0_ASSERT_INFO(out->op != NULL, "Op %s is not set", #op)
 	OVERWRITE_IF_SET(log_iter_init);
 	OVERWRITE_IF_SET(log_iter_fini);
@@ -943,7 +945,6 @@ m0_dtm0_recovery_machine_init(struct m0_dtm0_recovery_machine           *m,
 			      struct m0_dtm0_service                    *svc)
 {
 	M0_PRE(m != NULL);
-	M0_PRE(ops != NULL);
 
 	mod_init();
 	m->rm_svc = svc;
@@ -1600,7 +1601,12 @@ static void local_recovery_fom_coro(struct m0_fom *fom)
 		M0_CO_FUN(CO(fom), heq_await(fom, &F(state), &F(eoq)));
 		if (F(eoq))
 			goto out;
-	} while (F(state) != M0_NC_DTM_RECOVERING);
+	} while (!M0_IN(F(state), (M0_NC_ONLINE, M0_NC_DTM_RECOVERING)));
+
+	if (F(state) == M0_NC_ONLINE) {
+		M0_LOG(M0_WARN, "HA told DTM0 service to skip recovery.");
+		F(recovered) = true;
+	}
 
 	while (!F(recovered)) {
 		M0_CO_FUN(CO(fom), eolq_await(fom, &F(item)));
@@ -1801,8 +1807,8 @@ static int default_log_iter_next(struct m0_dtm0_recovery_machine *m,
 }
 
 /*
- * TODO:  it was copy-pasted from setup.c!
- * Export m0_cs_ha_process_event instead of using this thing.
+ * TODO: It was copy-pasted from setup.c!
+ * Export cs_ha_process_event instead of using this thing.
  */
 static void cs_ha_process_event(struct m0_motr                *cctx,
                                 enum m0_conf_ha_process_event  event)

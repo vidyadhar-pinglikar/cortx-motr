@@ -321,16 +321,12 @@ struct ut_remach {
 	struct m0_rpc_server_ctx         srv_ctx;
 	struct cl_ctx                    cli_ctx;
 
-	struct m0_dtm0_recovery_machine  srv_mach;
-	struct m0_dtm0_recovery_machine  cli_mach;
+	struct m0_dtm0_service          *svcs[UT_SIDE_NR];
+	struct m0_be_op                  recovered[UT_SIDE_NR];
 
-	struct m0_dtm0_service          *srv_svc;
-	struct m0_dtm0_service          *cli_svc;
-
+	/* Client-side stubs for conf objects. */
 	struct m0_conf_process           cli_procs[UT_SIDE_NR];
 	struct m0_mutex                  cli_proc_guards[UT_SIDE_NR];
-
-	struct m0_be_op                  recovered[UT_SIDE_NR];
 };
 
 struct ha_thought {
@@ -341,18 +337,21 @@ struct ha_thought {
 	.who = _who, .what = _what                    \
 }
 
-static struct m0_dtm0_recovery_machine *ut_remach_get(struct ut_remach *um,
-						      enum ut_sides side)
+static struct m0_dtm0_service *ut_remach_svc_get(struct ut_remach *um,
+						 enum ut_sides     side)
 {
-	struct m0_dtm0_recovery_machine *ms[UT_SIDE_NR] = {
-		[UT_SIDE_SRV] = &um->srv_mach,
-		[UT_SIDE_CLI] = &um->cli_mach,
-	};
 	M0_UT_ASSERT(side < UT_SIDE_NR);
-	return ms[side];
+	M0_UT_ASSERT(um->svcs[side] != NULL);
+	return um->svcs[side];
 }
 
-static const struct m0_fid *ut_remach_fid_get(enum ut_sides side)
+static struct m0_dtm0_recovery_machine *ut_remach_get(struct ut_remach *um,
+						      enum ut_sides     side)
+{
+	return &ut_remach_svc_get(um, side)->dos_remach;
+}
+
+static struct m0_fid *ut_remach_fid_get(enum ut_sides side)
 {
 	M0_UT_ASSERT(side < UT_SIDE_NR);
 	return &g_service_fids[side];
@@ -372,17 +371,32 @@ static enum ut_sides ut_remach_side_get(const struct m0_fid *svc)
 }
 
 static struct ut_remach *ut_remach_from(struct m0_dtm0_recovery_machine *m,
-					const struct m0_fid *svc)
+					const struct m0_fid *svc_fid)
 {
-	struct ut_remach *um = NULL;
+	struct ut_remach          *um = NULL;
+	struct m0_dtm0_service    *svc = M0_AMB(svc, m, dos_remach);
+	struct m0_reqh            *reqh = svc->dos_generic.rs_reqh;
+	struct m0_reqh_context    *rx = svc->dos_generic.rs_reqh_ctx;
+	struct m0_rpc_client_ctx  *cli_ctx;
+	struct m0_motr            *motr_ctx;
+	struct m0_rpc_server_ctx  *srv_ctx;
+	struct cl_ctx             *client;
+	enum ut_sides              side = ut_remach_side_get(svc_fid);
 
-	if (m0_fid_eq(ut_remach_fid_get(UT_SIDE_SRV), svc)) {
-		um = M0_AMB(um, m, srv_mach);
-	} else if (m0_fid_eq(ut_remach_fid_get(UT_SIDE_CLI), svc)) {
-		um = M0_AMB(um, m, cli_mach);
+	if (rx == NULL) {
+		M0_UT_ASSERT(side == UT_SIDE_CLI);
+		cli_ctx = M0_AMB(cli_ctx, reqh, rcx_reqh);
+		client = M0_AMB(client, cli_ctx, cl_ctx);
+		um = M0_AMB(um, client, cli_ctx);
+	} else {
+		M0_UT_ASSERT(side == UT_SIDE_SRV);
+		motr_ctx = M0_AMB(motr_ctx, rx, cc_reqh_ctx);
+		srv_ctx = M0_AMB(srv_ctx, motr_ctx, rsx_motr_ctx);
+		um = M0_AMB(um, srv_ctx, srv_ctx);
 	}
 
 	M0_UT_ASSERT(um != NULL);
+	M0_UT_ASSERT(ut_remach_get(um, side) == m);
 	return um;
 }
 
@@ -523,22 +537,8 @@ void um_ha_event_post(struct m0_dtm0_recovery_machine *m,
 		      const struct m0_fid             *tgt_svc,
 		      enum m0_conf_ha_process_event    event)
 {
-	struct ut_remach *um;
-	int               side;
-
-	const struct m0_fid           svcs[UT_SIDE_NR] = {
-		[UT_SIDE_SRV] = srv_dtm0_fid,
-		[UT_SIDE_CLI] = cli_srv_fid,
-	};
-
-	if (m0_fid_eq(tgt_svc, &svcs[UT_SIDE_SRV])) {
-		um = M0_AMB(um, m, srv_mach);
-		side = UT_SIDE_SRV;
-	} else if (m0_fid_eq(tgt_svc, &svcs[UT_SIDE_CLI])) {
-		um = M0_AMB(um, m, cli_mach);
-		side = UT_SIDE_CLI;
-	} else
-		M0_IMPOSSIBLE("Wrong service?");
+	struct ut_remach *um   = ut_remach_from(m, tgt_svc);
+	enum ut_sides     side = ut_remach_side_get(tgt_svc);
 
 	switch (event) {
 	case M0_CONF_HA_PROCESS_DTM_RECOVERED:
@@ -616,18 +616,21 @@ static void ut_srv_remach_init(struct ut_remach *um)
 	};
 
 	m0_fi_enable("m0_dtm0_in_ut", "ut");
+	m0_fi_enable("is_manual_ss_enabled", "ut");
 
 	rc = m0_rpc_server_start(sctx);
 	M0_UT_ASSERT(rc == 0);
 
 	srv_reqh = &sctx->rsx_motr_ctx.cc_reqh_ctx.rc_reqh;
-	srv_svc = m0_reqh_service_lookup(srv_reqh, &srv_dtm0_fid),
+	srv_svc = m0_reqh_service_lookup(srv_reqh,
+					 ut_remach_fid_get(UT_SIDE_SRV)),
 	M0_UT_ASSERT(srv_svc != NULL);
-	um->srv_svc = M0_AMB(um->srv_svc, srv_svc, dos_generic);
+	um->svcs[UT_SIDE_SRV] = M0_AMB(um->svcs[UT_SIDE_SRV],
+				       srv_svc, dos_generic);
 
-	rc = m0_dtm0_recovery_machine_init(&um->srv_mach,
+	rc = m0_dtm0_recovery_machine_init(ut_remach_get(um, UT_SIDE_SRV),
 					   ut_remach_ops_get(um),
-					   um->srv_svc);
+					   ut_remach_svc_get(um, UT_SIDE_SRV));
 	M0_UT_ASSERT(rc == 0);
 }
 
@@ -655,14 +658,10 @@ static void ut_cli_remach_conf_obj_fini(struct ut_remach *um)
 
 static void ut_cli_remach_init(struct ut_remach *um)
 {
+	int                     rc;
 	struct cl_ctx          *cctx = &um->cli_ctx;
 	struct m0_reqh_service *cli_svc;
-	int                     rc;
-	struct m0_fid           svcs[UT_SIDE_NR] = {
-		[UT_SIDE_SRV] = srv_dtm0_fid,
-		[UT_SIDE_CLI] = cli_srv_fid,
-	};
-	bool                     is_volatile[UT_SIDE_NR] = {
+	bool                    is_volatile[UT_SIDE_NR] = {
 		[UT_SIDE_SRV] = false,
 		[UT_SIDE_CLI] = true,
 	};
@@ -673,36 +672,39 @@ static void ut_cli_remach_init(struct ut_remach *um)
 			    m0_net_xprt_default_get());
 
 	rc = m0_dtm_client_service_start(&cctx->cl_ctx.rcx_reqh,
-					 &cli_srv_fid, &cli_svc);
+					 ut_remach_fid_get(UT_SIDE_CLI),
+					 &cli_svc);
 
 	M0_UT_ASSERT(rc == 0);
 	M0_UT_ASSERT(cli_svc != NULL);
 
-	um->cli_svc = M0_AMB(um->cli_svc, cli_svc, dos_generic);
+	um->svcs[UT_SIDE_CLI] = M0_AMB(um->svcs[UT_SIDE_CLI],
+				       cli_svc, dos_generic);
 
-	rc = m0_dtm0_recovery_machine_init(&um->cli_mach,
+	rc = m0_dtm0_recovery_machine_init(ut_remach_get(um, UT_SIDE_CLI),
 					   ut_remach_ops_get(um),
-					   um->cli_svc);
+					   um->svcs[UT_SIDE_CLI]);
 	M0_UT_ASSERT(rc == 0);
-	m0_ut_remach_populate(&um->cli_mach, um->cli_procs, svcs, is_volatile,
-			      UT_SIDE_NR);
+	m0_ut_remach_populate(ut_remach_get(um, UT_SIDE_CLI), um->cli_procs,
+			      g_service_fids, is_volatile, UT_SIDE_NR);
 }
 
 static void ut_srv_remach_fini(struct ut_remach *um)
 {
 	struct m0_rpc_server_ctx *sctx = &um->srv_ctx;
 
-	m0_dtm0_recovery_machine_fini(&um->srv_mach);
+	m0_dtm0_recovery_machine_fini(ut_remach_get(um, UT_SIDE_SRV));
 	m0_rpc_server_stop(sctx);
+	m0_fi_disable("is_manual_ss_enabled", "ut");
 	m0_fi_disable("m0_dtm0_in_ut", "ut");
 }
 
 static void ut_cli_remach_fini(struct ut_remach *um)
 {
 	struct cl_ctx          *cctx = &um->cli_ctx;
-	struct m0_reqh_service *cli_svc = &um->cli_svc->dos_generic;
+	struct m0_reqh_service *cli_svc = &um->svcs[UT_SIDE_CLI]->dos_generic;
 
-	m0_dtm0_recovery_machine_fini(&um->cli_mach);
+	m0_dtm0_recovery_machine_fini(ut_remach_get(um, UT_SIDE_CLI));
 	m0_dtm_client_service_stop(cli_svc);
 	dtm0_ut_client_fini(cctx);
 	ut_cli_remach_conf_obj_fini(um);
@@ -710,18 +712,16 @@ static void ut_cli_remach_fini(struct ut_remach *um)
 
 static void ut_remach_start(struct ut_remach *um)
 {
-	struct m0_dtm0_recovery_machine *srv_m = &um->srv_mach;
-	struct m0_dtm0_recovery_machine *cli_m = &um->cli_mach;
-	m0_dtm0_recovery_machine_start(srv_m);
-	m0_dtm0_recovery_machine_start(cli_m);
+	enum ut_sides side;
+	for (side = 0; side < UT_SIDE_NR; ++side)
+		m0_dtm0_recovery_machine_start(ut_remach_get(um, side));
 }
 
 static void ut_remach_stop(struct ut_remach *um)
 {
-	struct m0_dtm0_recovery_machine *srv_m = &um->srv_mach;
-	struct m0_dtm0_recovery_machine *cli_m = &um->cli_mach;
-	m0_dtm0_recovery_machine_stop(cli_m);
-	m0_dtm0_recovery_machine_stop(srv_m);
+	enum ut_sides side;
+	for (side = 0; side < UT_SIDE_NR; ++side)
+		m0_dtm0_recovery_machine_stop(ut_remach_get(um, side));
 }
 
 static void ut_remach_init(struct ut_remach *um)
@@ -756,15 +756,15 @@ static void ut_remach_fini(struct ut_remach *um)
 
 static void ut_remach_reset_srv(struct ut_remach *um)
 {
-	int rc;
+	int                              rc;
+	struct m0_dtm0_recovery_machine *m = ut_remach_get(um, UT_SIDE_SRV);
 
-	m0_dtm0_recovery_machine_stop(&um->srv_mach);
-	m0_dtm0_recovery_machine_fini(&um->srv_mach);
-	rc = m0_dtm0_recovery_machine_init(&um->srv_mach,
-					   ut_remach_ops_get(um),
-					   um->srv_svc);
+	m0_dtm0_recovery_machine_stop(m);
+	m0_dtm0_recovery_machine_fini(m);
+	rc = m0_dtm0_recovery_machine_init(m, ut_remach_ops_get(um),
+					   ut_remach_svc_get(um, UT_SIDE_SRV));
 	M0_UT_ASSERT(rc == 0);
-	m0_dtm0_recovery_machine_start(&um->srv_mach);
+	m0_dtm0_recovery_machine_start(m);
 }
 
 static void ut_remach_log_gen_sync(struct ut_remach *um,
