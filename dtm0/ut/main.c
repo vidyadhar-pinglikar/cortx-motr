@@ -427,6 +427,7 @@ static void ut_remach_log_add_sync(struct ut_remach *um,
 
 
 static void um_dummy_log_redo_post(struct m0_dtm0_recovery_machine *m,
+				   struct m0_fom                   *fom,
 				   const struct m0_fid *tgt_proc,
 				   const struct m0_fid *tgt_svc,
 				   struct dtm0_req_fop *redo,
@@ -442,6 +443,7 @@ static void um_dummy_log_redo_post(struct m0_dtm0_recovery_machine *m,
 }
 
 static void um_real_log_redo_post(struct m0_dtm0_recovery_machine *m,
+				  struct m0_fom                   *fom,
 				  const struct m0_fid *tgt_proc,
 				  const struct m0_fid *tgt_svc,
 				  struct dtm0_req_fop *redo,

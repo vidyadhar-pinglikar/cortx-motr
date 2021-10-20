@@ -57,6 +57,7 @@ struct m0_dtm0_recovery_machine_ops {
 	 * Post a REDO message to the target DTM0 service.
 	 */
 	void (*redo_post)(struct m0_dtm0_recovery_machine *m,
+			  struct m0_fom                   *fom,
 			  const struct m0_fid             *tgt_proc,
 			  const struct m0_fid             *tgt_svc,
 			  struct dtm0_req_fop             *redo,

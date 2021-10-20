@@ -801,6 +801,8 @@ Deviverables:
 #include "rpc/rpc_opcodes.h" /* M0_DTM0_RECOVERY_FOM_OPCODE */
 #include "lib/string.h"      /* m0_streq */
 #include "be/dtm0_log.h"     /* m0_dtm0_log_rec */
+#include "motr/setup.h"      /* m0_cs_reqh_context */
+#include "dtm0/drlink.h"     /* m0_dtm0_req_post */
 
 enum {
 	/*
@@ -1036,13 +1038,14 @@ static void recovery_machine_log_iter_fini(struct m0_dtm0_recovery_machine *m,
 }
 
 static void recovery_machine_redo_post(struct m0_dtm0_recovery_machine *m,
+				       struct m0_fom                   *fom,
 				       const struct m0_fid *tgt_proc,
 				       const struct m0_fid *tgt_svc,
 				       struct dtm0_req_fop *redo,
 				       struct m0_be_op *op)
 {
 	M0_PRE(m->rm_ops.redo_post != NULL);
-	m->rm_ops.redo_post(m, tgt_proc, tgt_svc, redo, op);
+	m->rm_ops.redo_post(m, fom, tgt_proc, tgt_svc, redo, op);
 }
 
 static void recovery_machine_recovered(struct m0_dtm0_recovery_machine *m,
@@ -1496,8 +1499,9 @@ static void restore(struct m0_fom *fom,
 			.dtr_txr       = record.dlr_txd,
 			.dtr_flags     = flags,
 		};
-		recovery_machine_redo_post(rf->rf_m, &rf->rf_tgt_proc,
-					   &rf->rf_tgt_svc, &F(redo), NULL);
+		recovery_machine_redo_post(rf->rf_m, &rf->rf_base,
+					   &rf->rf_tgt_proc, &rf->rf_tgt_svc,
+					   &F(redo), NULL);
 	} while (rc == 0);
 
 	recovery_machine_log_iter_fini(rf->rf_m, &rf->rf_log_iter);
@@ -1796,13 +1800,72 @@ static int default_log_iter_next(struct m0_dtm0_recovery_machine *m,
 	}
 }
 
+/*
+ * TODO:  it was copy-pasted from setup.c!
+ * Export m0_cs_ha_process_event instead of using this thing.
+ */
+static void cs_ha_process_event(struct m0_motr                *cctx,
+                                enum m0_conf_ha_process_event  event)
+{
+	enum m0_conf_ha_process_type type;
+
+	type = cctx->cc_mkfs ? M0_CONF_HA_PROCESS_M0MKFS :
+			       M0_CONF_HA_PROCESS_M0D;
+	if (cctx->cc_ha_is_started && !cctx->cc_no_conf &&
+	    cctx->cc_motr_ha.mh_link != NULL) {
+		m0_conf_ha_process_event_post(&cctx->cc_motr_ha.mh_ha,
+		                              cctx->cc_motr_ha.mh_link,
+		                              &cctx->cc_reqh_ctx.rc_fid,
+		                              m0_process(), event, type);
+	}
+}
+
+static void default_ha_event_post(struct m0_dtm0_recovery_machine *m,
+				  const struct m0_fid             *tgt_proc,
+				  const struct m0_fid             *tgt_svc,
+				  enum m0_conf_ha_process_event    event)
+{
+	struct m0_reqh *reqh;
+	(void) tgt_proc;
+	(void) tgt_svc;
+
+	M0_ASSERT_INFO(m->rm_local_rfom != NULL,
+		       "It is impossible to emit an HA event without local "
+		       "recovery FOM up and running.");
+	reqh = m0_fom_reqh(&m->rm_local_rfom->rf_base);
+	M0_ASSERT_INFO(m0_cs_reqh_context(reqh) != NULL,
+		       "A fully-functional motr process must have a reqh ctx.");
+	cs_ha_process_event(m0_cs_ctx_get(reqh), event);
+}
+
+static void default_redo_post(struct m0_dtm0_recovery_machine *m,
+			      struct m0_fom                   *fom,
+			      const struct m0_fid             *tgt_proc,
+			      const struct m0_fid             *tgt_svc,
+			      struct dtm0_req_fop             *redo,
+			      struct m0_be_op                 *op)
+{
+	int rc;
+
+	/* Not implemented yet */
+	M0_ASSERT(op == NULL);
+
+	rc = m0_dtm0_req_post(m->rm_svc, redo, tgt_svc, fom, false);
+	/*
+	 * We assume "perfect" links between ONLINE/RECOVERING processes.
+	 * If the link is not perfect then let's just kill the process
+	 * that is not able to send out REDOs.
+	 */
+	M0_ASSERT(rc == 0);
+}
+
 static const struct m0_dtm0_recovery_machine_ops default_ops = {
 	.log_iter_init = default_log_iter_init,
 	.log_iter_fini = default_log_iter_fini,
 	.log_iter_next = default_log_iter_next,
 
-	.redo_post     = NULL, /* Not implemented yet */
-	.ha_event_post = NULL, /* Not implemented yet */
+	.redo_post     = default_redo_post,
+	.ha_event_post = default_ha_event_post,
 };
 
 #undef M0_TRACE_SUBSYSTEM
