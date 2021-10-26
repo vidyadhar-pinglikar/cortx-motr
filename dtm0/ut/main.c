@@ -306,10 +306,13 @@ static void cas_xcode_test(void)
     m0_xcode_free_obj(&M0_XCODE_OBJ(m0_cas_op_xc, op_out));
 }
 
+extern void m0_dtm0_ut_drlink_simple();
+
 struct m0_ut_suite dtm0_ut = {
         .ts_name = "dtm0-ut",
         .ts_tests = {
-                { "xcode",   cas_xcode_test },
+                { "xcode",         &cas_xcode_test },
+                { "drlink-simple", &m0_dtm0_ut_drlink_simple },
 		{ NULL, NULL },
 	}
 };

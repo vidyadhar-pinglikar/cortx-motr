@@ -47,6 +47,7 @@ struct dtm0_fom {
 static int dtm0_emsg_fom_tick(struct m0_fom *fom);
 static int dtm0_pmsg_fom_tick(struct m0_fom *fom);
 static int dtm0_rmsg_fom_tick(struct m0_fom *fom);
+static int dtm0_tmsg_fom_tick(struct m0_fom *fom);
 static int dtm0_fom_create(struct m0_fop *fop, struct m0_fom **out,
 			       struct m0_reqh *reqh);
 static void dtm0_fom_fini(struct m0_fom *fom);
@@ -67,6 +68,12 @@ static const struct m0_fom_ops dtm0_rmsg_fom_ops = {
 static const struct m0_fom_ops dtm0_emsg_fom_ops = {
 	.fo_fini = dtm0_fom_fini,
 	.fo_tick = dtm0_emsg_fom_tick,
+	.fo_home_locality = dtm0_fom_locality
+};
+
+static const struct m0_fom_ops dtm0_tmsg_fom_ops = {
+	.fo_fini = dtm0_fom_fini,
+	.fo_tick = dtm0_tmsg_fom_tick,
 	.fo_home_locality = dtm0_fom_locality
 };
 
@@ -179,6 +186,7 @@ static int dtm0_fom_create(struct m0_fop *fop,
 	reply->dr_txr = (struct m0_dtm0_tx_desc) {};
 	reply->dr_rc = 0;
 
+	/* TODO avoid copy-paste */
 	if (req->dtr_msg == DTM_EXECUTE) {
 		M0_ASSERT_INFO(m0_dtm0_in_ut(), "Emsg FOM is only for UTs.");
 		rc = m0_dtm0_tx_desc_copy(&req->dtr_txr, &reply->dr_txr);
@@ -191,6 +199,9 @@ static int dtm0_fom_create(struct m0_fop *fop,
 	} else if (req->dtr_msg == DTM_REDO) {
 		m0_fom_init(&fom->dtf_fom, &fop->f_type->ft_fom_type,
 			    &dtm0_rmsg_fom_ops, fop, repfop, reqh);
+	} else if (req->dtr_msg == DTM_TEST) {
+		m0_fom_init(&fom->dtf_fom, &fop->f_type->ft_fom_type,
+			    &dtm0_tmsg_fom_ops, fop, repfop, reqh);
 	} else
 		M0_IMPOSSIBLE();
 
@@ -430,6 +441,21 @@ static int dtm0_rmsg_fom_tick(struct m0_fom *fom)
 		cs_ha_process_event(m0_cs_ctx_get(m0_fom_reqh(fom)),
 				    M0_CONF_HA_PROCESS_DTM_RECOVERED);
 		*/
+		m0_fom_phase_set(fom, M0_FOPH_SUCCESS);
+		result = M0_RC(M0_FSO_AGAIN);
+	}
+	return M0_RC(result);
+}
+
+static int dtm0_tmsg_fom_tick(struct m0_fom *fom)
+{
+	int result;
+	int phase = m0_fom_phase(fom);
+	M0_ENTRY("fom %p phase %d", fom, phase);
+
+	if (m0_fom_phase(fom) < M0_FOPH_NR) {
+		result = m0_fom_tick_generic(fom);
+	} else {
 		m0_fom_phase_set(fom, M0_FOPH_SUCCESS);
 		result = M0_RC(M0_FSO_AGAIN);
 	}
