@@ -419,6 +419,9 @@ static int dtm0_rmsg_fom_tick(struct m0_fom *fom)
 {
 	int result;
 	int phase = m0_fom_phase(fom);
+	struct m0_dtm0_service *svc = m0_dtm0_fom2service(fom);
+	struct m0_dtm0_recovery_machine *m = &svc->dos_remach;
+	struct dtm0_req_fop    *redo = m0_fop_data(fom->fo_fop);
 	M0_ENTRY("fom %p phase %d", fom, phase);
 
 	if (m0_fom_phase(fom) < M0_FOPH_NR) {
@@ -430,6 +433,8 @@ static int dtm0_rmsg_fom_tick(struct m0_fom *fom)
 		cs_ha_process_event(m0_cs_ctx_get(m0_fom_reqh(fom)),
 				    M0_CONF_HA_PROCESS_DTM_RECOVERED);
 		*/
+		M0_BE_OP_SYNC(op,
+			      m0_dtm0_recovery_machine_redo_post(m, redo, &op));
 		m0_fom_phase_set(fom, M0_FOPH_SUCCESS);
 		result = M0_RC(M0_FSO_AGAIN);
 	}

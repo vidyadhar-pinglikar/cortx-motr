@@ -879,6 +879,14 @@ struct eolq_item {
 	enum m0_ha_obj_state ei_ha_state;
 };
 
+/*
+ * A global variable to set off parts of the code that were added
+ * specifically for the integration (all2all) test script.
+ * Later on, they need to be removed (once we get a better
+ * way of testing).
+ */
+const bool ALL2ALL = true;
+
 M0_TL_DESCR_DEFINE(rfom, "recovery_fom",
 		   static, struct recovery_fom, rf_linkage,
 		   rf_magic, M0_DTM0_RMACH_MAGIC, M0_DTM0_RMACH_HEAD_MAGIC);
@@ -945,6 +953,7 @@ m0_dtm0_recovery_machine_init(struct m0_dtm0_recovery_machine           *m,
 			      struct m0_dtm0_service                    *svc)
 {
 	M0_PRE(m != NULL);
+	M0_ENTRY("m=%p, svc=%p", m, svc);
 
 	mod_init();
 	m->rm_svc = svc;
@@ -959,6 +968,7 @@ m0_dtm0_recovery_machine_init(struct m0_dtm0_recovery_machine           *m,
 M0_INTERNAL void
 m0_dtm0_recovery_machine_fini(struct m0_dtm0_recovery_machine *m)
 {
+	M0_ENTRY("m=%p", m);
 	unpopulate_foms(m);
 	recovery_machine_lock(m);
 	if (m->rm_sm.sm_state == M0_DRMS_INIT)
@@ -968,7 +978,9 @@ m0_dtm0_recovery_machine_fini(struct m0_dtm0_recovery_machine *m)
 	m0_sm_group_fini(&m->rm_sm_group);
 	M0_ASSERT(rfom_tlist_is_empty(&m->rm_rfoms));
 	rfom_tlist_fini(&m->rm_rfoms);
+	M0_LEAVE();
 }
+
 
 M0_INTERNAL void
 m0_dtm0_recovery_machine_start(struct m0_dtm0_recovery_machine *m)
@@ -979,6 +991,9 @@ m0_dtm0_recovery_machine_start(struct m0_dtm0_recovery_machine *m)
 		m0_fom_queue(&rf->rf_base);
 	}
 	m0_tlist_endfor;
+
+	if (ALL2ALL)
+		M0_LOG(M0_DEBUG, "ALL2ALL_STARTED");
 }
 
 M0_INTERNAL void
@@ -989,6 +1004,7 @@ m0_dtm0_recovery_machine_stop(struct m0_dtm0_recovery_machine *m)
 
 	m0_tl_for(rfom, &m->rm_rfoms, rf) {
 		m0_be_queue_lock(&rf->rf_heq);
+		M0_LOG(M0_DEBUG, "heq_end " FID_F, FID_P(&rf->rf_tgt_svc));
 		m0_be_queue_end(&rf->rf_heq);
 		m0_be_queue_unlock(&rf->rf_heq);
 	}
@@ -1174,6 +1190,10 @@ static void heq_post(struct recovery_fom *rf, enum m0_ha_obj_state state)
 	M0_BE_OP_SYNC(op, M0_BE_QUEUE_PUT(&rf->rf_heq, &op, &event));
 	m0_be_queue_unlock(&rf->rf_heq);
 
+	M0_LOG(M0_DEBUG, "heq_enq " FID_F " %s ",
+	       FID_P(&rf->rf_tgt_svc),
+	       m0_ha_state2str(state));
+
 	if (!rf->rf_is_local)
 		eolq_post(rf->rf_m,
 			  &(struct eolq_item) {
@@ -1246,6 +1266,27 @@ static int recovery_fom_init(struct recovery_fom             *rf,
 	return M0_RC(rc);
 }
 
+/*
+ * Mark the queue as ended and drain it until the end.
+ */
+static void m0_be_queue__finish(struct m0_be_queue *bq, struct m0_buf *item)
+{
+	bool got = true;
+
+	m0_be_queue_lock(bq);
+	if (!bq->bq_the_end) {
+		m0_be_queue_end(bq);
+		while (got)
+			M0_BE_OP_SYNC(op, m0_be_queue_get(bq, &op, item, &got));
+	}
+	M0_POST(bq->bq_the_end);
+	m0_be_queue_unlock(bq);
+}
+#define M0_BE_QUEUE__FINISH(bq, item_type) ({                \
+	item_type item;                                      \
+	m0_be_queue__finish(bq, &M0_BUF_INIT_PTR(&item));    \
+})
+
 static void recovery_fom_fini(struct recovery_fom *rf)
 {
 	m0_clink_del_lock(&rf->rf_ha_clink);
@@ -1269,7 +1310,7 @@ static void recovery_fom_self_fini(struct m0_fom *fom)
 	is_stopped = rfom_tlist_is_empty(&m->rm_rfoms);
 	recovery_fom_fini(rf);
 	m0_fom_fini(fom);
-	m0_free(fom);
+	m0_free(rf);
 	if (is_stopped)
 		m0_sm_move(&m->rm_sm, 0, M0_DRMS_STOPPED);
 	recovery_machine_unlock(m);
@@ -1439,11 +1480,17 @@ static void heq_await(struct m0_fom *fom, enum m0_ha_obj_state *out, bool *eoq)
 	M0_CO_YIELD_RC(CO(fom), m0_be_op_tick_ret(&F(op), fom, RFS_WAITING));
 	m0_be_op_fini(&F(op));
 
+
 	if (F(got)) {
+		M0_LOG(M0_DEBUG, "heq_deq " FID_F " %s" ,
+		       FID_P(&rf->rf_tgt_svc),
+		       m0_ha_state2str(F(state)));
 		M0_ASSERT(ha_event_invariant(F(state)));
 		*out = F(state);
-	} else
+	} else {
+		M0_LOG(M0_DEBUG, "heq_deq " FID_F, FID_P(&rf->rf_tgt_svc));
 		*eoq = true;
+	}
 }
 
 static void eolq_await(struct m0_fom *fom, struct eolq_item *out)
@@ -1535,8 +1582,10 @@ static void remote_recovery_fom_coro(struct m0_fom *fom)
 			F(action) = rf->rf_is_volatile ? heq_await : restore;
 			break;
 		case M0_NC_FAILED:
-			M0_IMPOSSIBLE("Eviction is not handled yet");
-			break;
+			if (ALL2ALL)
+				M0_LOG(M0_WARN, "Eviction is not supported.");
+			else
+				M0_IMPOSSIBLE("Eviction is not supported.");
 		default:
 			F(action) = heq_await;
 			break;
@@ -1548,14 +1597,44 @@ static void remote_recovery_fom_coro(struct m0_fom *fom)
 	m0_fom_phase_set(fom, RFS_DONE);
 }
 
+static bool was_log_replayed(struct recovery_fom *rf)
+{
+	/*
+	 * We should ignore UNKNOWN and FAILED clients.
+	 */
+	bool is_na = rf->rf_is_volatile &&
+		M0_IN(rf->rf_last_known_ha_state,
+		      (M0_NC_UNKNOWN, M0_NC_FAILED));
+
+	bool outcome = ergo(!rf->rf_is_local && !is_na,
+			    M0_IN(rf->rf_last_known_ha_state,
+				  (M0_NC_ONLINE, M0_NC_DTM_RECOVERING)) &&
+			    rf->rf_last_known_eol);
+
+	M0_LOG(M0_DEBUG,
+	       "id=" FID_F ", is_volatile=%d, is_na=%d, "
+	       "is_local=%d, state=%s, got_eol=%d => %d",
+	       FID_P(&rf->rf_tgt_svc),
+	       (int) rf->rf_is_volatile,
+	       (int) is_na,
+	       (int) rf->rf_is_local,
+	       m0_ha_state2str(rf->rf_last_known_ha_state),
+	       (int) rf->rf_last_known_eol,
+	       (int) outcome);
+
+	return outcome;
+}
+
 static bool is_local_recovery_completed(struct m0_dtm0_recovery_machine *m)
 {
-	return m0_tl_exists(rfom, r, &m->rm_rfoms, !r->rf_is_local) &&
-		m0_tl_forall(rfom, r, &m->rm_rfoms,
-			     ergo(!r->rf_is_local,
-				  M0_IN(r->rf_last_known_ha_state,
-					(M0_NC_ONLINE, M0_NC_DTM_RECOVERING)) &&
-				  r->rf_last_known_eol));
+	M0_ENTRY();
+
+	if (!m0_tl_exists(rfom, r, &m->rm_rfoms, !r->rf_is_local))
+		M0_LOG(M0_WARN, "Recovery cannot be completed because there "
+		       "are no remote DTM0 services.");
+
+	return M0_RC(m0_tl_exists(rfom, r, &m->rm_rfoms, !r->rf_is_local) &&
+		m0_tl_forall(rfom, r, &m->rm_rfoms, was_log_replayed(r)));
 }
 
 static void remote_state_update(struct recovery_fom    *rf,
@@ -1601,7 +1680,10 @@ static void local_recovery_fom_coro(struct m0_fom *fom)
 		M0_CO_FUN(CO(fom), heq_await(fom, &F(state), &F(eoq)));
 		if (F(eoq))
 			goto out;
-	} while (!M0_IN(F(state), (M0_NC_ONLINE, M0_NC_DTM_RECOVERING)));
+
+		if (F(state) == M0_NC_ONLINE && !ALL2ALL)
+			break;
+	} while (F(state) != M0_NC_DTM_RECOVERING);
 
 	if (F(state) == M0_NC_ONLINE) {
 		M0_LOG(M0_WARN, "HA told DTM0 service to skip recovery.");
@@ -1627,14 +1709,15 @@ static void local_recovery_fom_coro(struct m0_fom *fom)
 		recovery_machine_unlock(rf->rf_m);
 	}
 
+	M0_BE_QUEUE__FINISH(&rf->rf_eolq, typeof(F(item)));
 	/* Mark eolq as "ended" and drain the queue until the end. */
-	m0_be_queue_lock(&rf->rf_eolq);
-	m0_be_queue_end(&rf->rf_eolq);
-	m0_be_queue_unlock(&rf->rf_eolq);
-	do {
-		M0_CO_FUN(CO(fom), eolq_await(fom, &F(item)));
-	} while (F(item).ei_type != EIT_END);
-	M0_ASSERT(rf->rf_eolq.bq_the_end);
+	/*m0_be_queue_lock(&rf->rf_eolq);*/
+	/*m0_be_queue_end(&rf->rf_eolq);*/
+	/*m0_be_queue_unlock(&rf->rf_eolq);*/
+	/*do {*/
+		/*M0_CO_FUN(CO(fom), eolq_await(fom, &F(item)));*/
+	/*} while (F(item).ei_type != EIT_END);*/
+	/*M0_ASSERT(rf->rf_eolq.bq_the_end);*/
 
 	/*
 	 * Emit "RECOVERED". It shall cause HA to tell us to transit from
@@ -1647,12 +1730,14 @@ static void local_recovery_fom_coro(struct m0_fom *fom)
 		M0_CO_FUN(CO(fom), heq_await(fom, &F(state), &F(eoq)));
 		M0_ASSERT(ergo(!F(eoq), F(state) == M0_NC_ONLINE));
 		if (!F(eoq)) {
-			M0_CO_FUN(CO(fom), heq_await(fom, &F(state), &F(eoq)));
+			M0_CO_FUN(CO(fom), heq_await(fom, &F(state),
+						     &F(eoq)));
 			M0_ASSERT(F(eoq));
 		}
 	}
 
 out:
+	M0_BE_QUEUE__FINISH(&rf->rf_eolq, typeof(F(item)));
 	m0_fom_phase_set(fom, RFS_DONE);
 }
 
@@ -1713,6 +1798,9 @@ m0_dtm0_recovery_machine_redo_post(struct m0_dtm0_recovery_machine *m,
 	struct eolq_item     item = {};
 	struct recovery_fom *rf;
 
+	M0_ENTRY("m=%p, is_eol=%d, from=" FID_F,
+		 m, (int) is_eol, FID_P(initiator));
+
 	if (is_eol) {
 		M0_ASSERT_INFO(!is_eviction,
 			       "TODO: Eviction is not handled yet.");
@@ -1742,6 +1830,8 @@ m0_dtm0_recovery_machine_redo_post(struct m0_dtm0_recovery_machine *m,
 		m0_be_op_active(op);
 		m0_be_op_done(op);
 	}
+
+	M0_LEAVE();
 }
 
 static int default_log_iter_init(struct m0_dtm0_recovery_machine *m,
@@ -1834,6 +1924,11 @@ static void default_ha_event_post(struct m0_dtm0_recovery_machine *m,
 	struct m0_reqh *reqh;
 	(void) tgt_proc;
 	(void) tgt_svc;
+
+	if (ALL2ALL) {
+		M0_LOG(M0_DEBUG, "ALL2ALL_DTM_RECOVERED");
+		return;
+	}
 
 	M0_ASSERT_INFO(m->rm_local_rfom != NULL,
 		       "It is impossible to emit an HA event without local "

@@ -23,9 +23,13 @@ M0D_PIDS=()
 
 M0D_CLI_FID_DEC=
 M0D_CLI_FID_HEX=
+MOD_CLI_EP=
 
 POOL_WIDTH=4
 IPOOL_WIDTH=2
+
+# m0d that got killed
+VICTIM=0
 
 . ${MOTR_ROOT}/scripts/addb-py/chronometry/common/common_funcs
 
@@ -64,6 +68,8 @@ function create_m0crate_cfg()
     local PROCESS_FID=$(echo $svcs_json_out | jq -r 'select( .name | contains("m0_client")) | .fid')
     local MOTR_HA_ADDR=$(echo $svcs_json_out | jq -r 'select( .name | contains("hax")) | .ep')
 
+    MOD_CLI_EP=$MOTR_LOCAL_ADDR
+
     local M0CRATE_CFG_TMP=m0crate_cfg.tmp
     cp $M0CRATE_CFG_IN $M0CRATE_CFG_TMP
     sed -i "s/###__PROF__###/$PROF/g" $M0CRATE_CFG_TMP
@@ -85,56 +91,140 @@ function get_params_for_ha_msgs()
     M0D_CLI_FID_HEX=$(echo $cli_json_out | jq -r '.fid' | sed -E 's/0x720+([0-9][:]0x[A-Za-z0-9]+)/\1/')
 }
 
-function ha_msg_send_transient()
+# params
+# (i) whom to send the message (endpoint). Use "cli" for the client; 0, 1, 2, etc. for m0ds.
+# (ii) who has changed its state. Use "cli" or 0, 1, 2.
+# (iii) what happened. Use "transient", "online" etc.
+function ha_msg_send()
 {
-    # Here we send "TRANSIENT" messages to trigger start of
-    # HA messages handling on the m0d side as dtm0 doesn't
-    # handle them until "TRANSIENT" received due to incomplete
-    # implementation on the Hare side.
-    for i in $(seq 0 $((${#M0D_ENDPOINTS[@]}-1))) ; do
-        for j in $(seq 0 $((${#M0D_FIDS_DEC[@]}-1))) ; do
-            if [[ $i -ne $j ]]; then
-                $MOTR_ST_UTILS_DIR/ha_msg_send.sh "${M0D_ENDPOINTS[$i]}" "^r|${M0D_FIDS_DEC[$j]}" "transient"
-                break
-            fi
-        done
+    local whom="$1"
+    local who="$2"
+    local what="$3"
+
+    if [[ "x$whom" == "cli" ]]; then
+        whom="${MOD_CLI_EP}"
+    else
+        whom="${M0D_ENDPOINTS[$whom]}"
+    fi
+
+    if [[ "x$who" == "cli" ]]; then
+        who="${M0D_CLI_FID_DEC}"
+    else
+        who="${M0D_FIDS_DEC[$who]}"
+    fi
+
+    _info "ha_msg_send: whom='${whom}', who='${who}', what='${what}'"
+    $MOTR_ST_UTILS_DIR/ha_msg_send.sh "$whom" "^r|$who" "$what"
+}
+
+function ha_msg_send_cli()
+{
+    local whom="cli"
+    local who="$1"
+    local what="$2"
+    ha_msg_send $whom $who $what
+}
+
+function ha_msg_send_m0ds()
+{
+    local who="$1"
+    local what="$2"
+
+    if [[ ${#M0D_ENDPOINTS[@]} -ne ${#M0D_FIDS_DEC[@]} ]]; then
+        echo "The number of endpoints is not equal to the number of fids. How is that possible?"
+        exit 1
+    fi
+
+    for i in $(seq 0 $((${#M0D_ENDPOINTS[@]}-1))); do
+        ha_msg_send $i $who $what
     done
 }
 
-function ha_msg_send_online()
+function ha_msg_send_all()
 {
-    # Here we send "ONLINE" messages to trigger connections logic.
-    for i in $(seq 0 $((${#M0D_ENDPOINTS[@]}-1))) ; do
-        for j in $(seq 0 $((${#M0D_FIDS_DEC[@]}-1))) ; do
-            if [[ $i -ne $j ]]; then
-                $MOTR_ST_UTILS_DIR/ha_msg_send.sh "${M0D_ENDPOINTS[$i]}" "^r|${M0D_FIDS_DEC[$j]}" "online"
-            fi
-        done
-    done
+    local who="$1"
+    local what="$2"
+    ha_msg_send_cli  "$who" "$what"
+    ha_msg_send_m0ds "$who" "$what"
 }
 
-function ha_msg_send_cli_online()
+# param
+# (i)   trace_path Path to the trace file
+# (ii)  pattern    String to grep.
+# (iii) exp_cnt    Expected number of lines that match the pattern.
+function expect_trace_lines
 {
-    # Here we send "ONLINE" messages to connect servers to client.
-    for i in $(seq 0 $((${#M0D_ENDPOINTS[@]}-1))) ; do
-        $MOTR_ST_UTILS_DIR/ha_msg_send.sh "${M0D_ENDPOINTS[$i]}" "^r|${M0D_CLI_FID_DEC}" "online"
-    done
+    local trace_path="$1"
+    local pattern="$2"
+    local exp_cnt="$3"
+    local cnt
+    local cmd;
+
+    _info "expect trace: path=$trace_path, pattern=$pattern, exp_cnt=$exp_cnt"
+    cnt=$($MOTR_ROOT/utils/trace/m0trace -i "$trace_path" | grep -c "$pattern")
+    if [[ $cnt -ne $exp_cnt ]]; then
+        _info "Unexpected number of trace lines: $cnt != $exp_cnt"
+        return 1
+    fi
+
+    _info "Found"
+    return 0
 }
 
-function expected_trace_lines_num()
+function expect_trace_lines_from_m0d()
+{
+    local index="$1"
+    local pattern="$2"
+    local exp_cnt="$3"
+    local path="${M0D_DIR_COMMON}${M0D_FIDS_HEX[index]}/m0trace.${M0D_PIDS[index]}"
+
+    if expect_trace_lines "$path" "$pattern" "$exp_cnt"; then
+        return 0;
+    fi
+
+    return 1;
+}
+
+function expect_trace_lines_from_m0ds()
 {
     local pattern="$1"
     local exp_cnt=$2
-    local cnt
 
     for i in ${!M0D_PIDS[@]} ; do
-        cnt=$($MOTR_ROOT/utils/trace/m0trace -i "${M0D_DIR_COMMON}${M0D_FIDS_HEX[i]}/m0trace.${M0D_PIDS[i]}" | grep "$pattern" | wc -l)
-        if [[ $cnt -ne $exp_cnt ]]; then
+        if ! expect_trace_lines_from_m0d "$i" "$pattern" "$exp_cnt"; then
+            _info "Not found in ${M0D_PIDS[i]}"
             return 1
         fi
     done
 
-    return 0
+    return 0;
+}
+
+function expect_trace_lines_from_cli()
+{
+    local pattern="$2"
+    local exp_cnt="$3"
+    local path="$PWD/m0trace.$CLIENT_PID"
+    local cnt
+
+    if ! expect_trace_lines "$path" "$pattern" "$exp_cnt"; then
+        return 1;
+    fi
+
+    return 0;
+}
+
+function expect_trace_lines_from_all()
+{
+    local pattern="$2"
+    local exp_cnt="$3"
+
+    if expect_trace_lines_from_m0ds "$pattern" "$exp_cnt" && \
+        expect_trace_lines_from_cli  "$pattern" "$exp_cnt"; then
+        return 0;
+    fi
+
+    return 1
 }
 
 function addb_dump()
@@ -186,9 +276,11 @@ function fail()
     exit 1
 }
 
-function main()
+function simple_boot_cycle()
 {
     local cli_pid
+
+    _info "Starting the simple boot cycle"
 
     ${MOTR_UTILS_DIR}/m0setup --init-loop-only -s 1 -d ${TEST_ROOT} --pool-width ${POOL_WIDTH} --ipool-width ${IPOOL_WIDTH}
 
@@ -220,4 +312,182 @@ function main()
     _info "TEST STATUS: PASSED"
 }
 
-main
+function boot_phase()
+{
+    local cli_pid
+
+    _info "Starting recovery:boot"
+
+    ${MOTR_UTILS_DIR}/m0setup --init-loop-only -s 1 -d ${TEST_ROOT} --pool-width ${POOL_WIDTH} --ipool-width ${IPOOL_WIDTH}
+
+    _info "Bootstrapping the cluster using Hare..."
+    bootstrap_cluster
+
+    get_params_for_ha_msgs
+    get_m0d_pids
+
+    _info "Create m0crate configuration..."
+    create_m0crate_cfg
+
+    _info "Run the client..."
+    $MOTR_ROOT/motr/m0crate/m0crate -S $M0CRATE_CFG &
+    cli_pid=$!
+    _info "Client pid: ${cli_pid}"
+    CLIENT_PID=${cli_pid}
+}
+
+function online_phase()
+{
+    _info "Starting recovery:online"
+
+    _info "Wait until every m0d started"
+    while ! expect_trace_lines_from_m0ds "ALL2ALL_STARTED" 1; do
+        :;
+    done
+
+    #_info "Let everyone know that all m0ds are recovering."
+    #for i in "${!M0D_PIDS[@]}" ; do
+        #ha_msg_send_all "$i" "dtm-recovering";
+    #done
+
+    #_info "Wait until m0ds get recovered."
+    #while ! expect_trace_lines_from_m0ds "ALL2ALL_DTM_RECOVERED" 1; do
+        #:;
+    #done
+
+    _info "Let everyone know that all m0ds are online."
+    for i in "${!M0D_PIDS[@]}" ; do
+        ha_msg_send_all "$i" "online";
+    done
+}
+
+function recovery_phase()
+{
+    _info "Starting recovery:recovery"
+    local svc_name="m0d@0x720000000000000${M0D_FIDS_HEX[VICTIM]}.service"
+
+    # Kill one of the m0ds.
+    kill -9 "${M0D_PIDS[VICTIM]}"
+
+    # Let everyone know that the victim got killed.
+    ha_msg_send 1 "${VICTIM}" "transient"
+    ha_msg_send 2 "${VICTIM}" "transient"
+    #ha_msg_send_all "${VICTIM}" "transient";
+
+    # Resurrect the victim.
+    echo "Starting: $svc_name"
+
+    systemctl start "$svc_name"
+
+    # Victim's PID should be updated.
+    M0D_PIDS=()
+    get_m0d_pids
+
+    _info "Wait until the victim gets started."
+    while ! expect_trace_lines_from_m0d ${VICTIM} "ALL2ALL_STARTED" 1; do
+        :;
+    done
+
+    # Replay transient event to the victim.
+    ha_msg_send ${VICTIM} ${VICTIM} "transient"
+
+    # Replay online event to the victim
+    ha_msg_send ${VICTIM} 1 "online"
+    ha_msg_send ${VICTIM} 2 "online"
+
+
+    # Initiate recovery procedures
+    # XXX: The victim should learn it first.
+    ha_msg_send ${VICTIM} ${VICTIM} "dtm-recovering"
+    sleep 1
+    ha_msg_send 1 "${VICTIM}" "dtm-recovering"
+    ha_msg_send 2 "${VICTIM}" "dtm-recovering"
+
+    _info "Wait until the victim gets recovered."
+    while ! expect_trace_lines_from_m0d ${VICTIM} "ALL2ALL_DTM_RECOVERED" 1; do
+        :;
+    done
+
+    # Telll everyone (except client) that the victim is online.
+    ha_msg_send_m0ds ${VICTIM} "online"
+}
+
+function shutdown_phase()
+{
+    _info "Starting recovery:shutdown"
+    wait ${cli_pid}
+    stop_cluster
+}
+
+function dump_phase()
+{
+    _info "Starting recovery:dump"
+
+    addb_dump
+
+    _info "Checking processes exit status..."
+    processes_status_check || {
+        _err "TEST STATUS: FAIL"
+        exit 1
+    }
+
+    _info "TEST STATUS: PASSED"
+}
+
+function recovery_cycle()
+{
+    _info "Starting the recovery cycle"
+
+    boot_phase && \
+        online_phase && \
+        recovery_phase && \
+        shutdown_phase && \
+        dump_phase
+}
+
+# params:
+# (i) cycle_name Name of the test (cycle)
+# (ii) phase_name Name of a phase in the cycle.
+function main()
+{
+    local cycle_name="$1"
+    local phase_name="$2"
+
+    if [ "x$phase_name" == "x" ]; then
+        case $cycle_name in
+            "s")
+                simple_boot_cycle;;
+            "r")
+                recovery_cycle;;
+            *)
+                simple_boot_cycle;;
+        esac
+    else
+        if [[ "x$cycle_name" == "xr" ]]; then
+            case $phase_name in
+                "boot")
+                    boot_phase;;
+                "online")
+                    online_phase;;
+                "recovery")
+                    recovery_phase;;
+                "shutdown")
+                    shutdown_phase;;
+                "dump")
+                    dump_phase;;
+                *)
+                    echo "Wrong phase: $phase_name"
+                    echo "Use one of the following: "
+                    echo "  boot online recovery shutdown dump"
+                    exit 1;;
+            esac
+        else
+            echo "Unsupported cycle: $cycle_name."
+            echo "Use 'r' or 's' (recovery, simple)."
+            exit 1
+        fi
+    fi
+
+}
+
+main $@

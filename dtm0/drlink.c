@@ -97,14 +97,18 @@ static struct dtm0_req_fop *dtm0_req_fop_dup(const struct dtm0_req_fop *src)
 	if (dst == NULL)
 		return NULL;
 
-	rc = m0_dtm0_tx_desc_copy(&src->dtr_txr, &dst->dtr_txr);
-	if (rc != 0) {
-		M0_ASSERT(rc == -ENOMEM);
-		m0_free(dst);
-		return NULL;
-	}
+	/* Copy non-dynamic parts. */
+	*dst = *src;
 
-	dst->dtr_msg = src->dtr_msg;
+	/* Replace dynamic parts if there any. */
+	if (!m0_dtm0_tx_desc_is_none(&src->dtr_txr)) {
+		rc = m0_dtm0_tx_desc_copy(&src->dtr_txr, &dst->dtr_txr);
+		if (rc != 0) {
+			M0_ASSERT(rc == -ENOMEM);
+			m0_free(dst);
+			return NULL;
+		}
+	}
 
 	return dst;
 }
@@ -237,6 +241,7 @@ enum drlink_fom_state {
 	DRF_INIT = M0_FOM_PHASE_INIT,
 	DRF_DONE = M0_FOM_PHASE_FINISH,
 	DRF_LOCKING = M0_FOM_PHASE_NR,
+	DRF_DISCONNECTING,
 	DRF_CONNECTING,
 	DRF_SENDING,
 	DRF_WAITING_FOR_REPLY,
@@ -269,9 +274,12 @@ static struct m0_sm_state_descr drlink_fom_states[] = {
 		.sd_name    = #name,  \
 		.sd_allowed = allowed \
 	}
-	_ST(DRF_LOCKING,           M0_BITS(DRF_CONNECTING,
+	_ST(DRF_LOCKING,           M0_BITS(DRF_DISCONNECTING,
+					   DRF_CONNECTING,
 					   DRF_SENDING,
 					   DRF_FAILED)),
+	_ST(DRF_DISCONNECTING,        M0_BITS(DRF_CONNECTING,
+					      DRF_FAILED)),
 	_ST(DRF_CONNECTING,        M0_BITS(DRF_SENDING,
 					   DRF_FAILED)),
 	_ST(DRF_SENDING,           M0_BITS(DRF_DONE,
@@ -382,6 +390,9 @@ static enum dpr_state dpr_state_infer(struct dtm0_process *proc)
 	 *		return FAILED;
 	 * @endverbatim
 	 */
+	if (proc->dop_rlink.rlk_sess.s_cancelled)
+		return DPR_TRANSIENT;
+
 	if (m0_rpc_link_is_connected(&proc->dop_rlink))
 		return DPR_ONLINE;
 
@@ -411,7 +422,50 @@ static void drlink_addb_drf2parent_relate(struct drlink_fom *drf)
 		     m0_sm_id_get(&drf->df_gen.fo_sm_phase));
 }
 
+
 #define F M0_CO_FRAME_DATA
+
+M0_INTERNAL void m0_rpc_link_disconnect_async(struct m0_rpc_link *rlink,
+					      m0_time_t abs_timeout,
+					      struct m0_clink *wait_clink);
+
+struct disconnect_ctx {
+	struct m0_clink dc_clink;
+	struct m0_co_op dc_op;
+};
+
+
+static bool disconnect_cb(struct m0_clink *clink)
+{
+	struct disconnect_ctx *dc = M0_AMB(dc, clink, dc_clink);
+	m0_co_op_done(&dc->dc_op);
+	return false;
+}
+
+static void co_disconnect(struct m0_co_context *context,
+		       struct dtm0_process  *proc)
+{
+	struct drlink_fom  *drf  = M0_AMB(drf, context, df_co);
+	struct m0_fom      *fom  = &drf->df_gen;
+
+	M0_CO_REENTER(context, struct disconnect_ctx dc;);
+
+	M0_SET0(&F(dc));
+	m0_clink_init(&F(dc).dc_clink, disconnect_cb);
+	F(dc).dc_clink.cl_is_oneshot = true;
+	m0_co_op_init(&F(dc).dc_op);
+	m0_co_op_active(&F(dc).dc_op);
+
+	m0_rpc_link_disconnect_async(&proc->dop_rlink, M0_MKTIME(1, 0),
+				     &F(dc).dc_clink);
+
+	M0_CO_YIELD_RC(context,
+		       m0_co_op_tick_ret(&F(dc).dc_op, fom, DRF_DISCONNECTING));
+
+	m0_clink_fini(&F(dc).dc_clink);
+	m0_co_op_fini(&F(dc).dc_op);
+}
+
 static void drlink_coro_fom_tick(struct m0_co_context *context)
 {
 	int                 rc   = 0;
@@ -448,6 +502,10 @@ static void drlink_coro_fom_tick(struct m0_co_context *context)
 	M0_ASSERT(m0_long_is_write_locked(&F(proc)->dop_llock, fom));
 
 	if (dpr_state_infer(F(proc)) == DPR_TRANSIENT) {
+		if (m0_rpc_link_is_connected(&F(proc)->dop_rlink)) {
+			M0_CO_FUN(context, co_disconnect(context, F(proc)));
+		}
+
 		rc = dtm0_process_rlink_reinit(F(proc), drf);
 		if (rc != 0)
 			goto unlock;
