@@ -1539,7 +1539,7 @@ static int rconfc_herd_fini(struct m0_rconfc *rconfc)
 			m0_rpc_conn_sessions_cancel(
 				m0_confc2conn(&lnk->rl_confc));
 			m0_mutex_unlock(&rconfc->rc_herd_lock);
-			return M0_RC(1);
+			return M0_RC(-EAGAIN);
 		}
 		if (lnk->rl_fom_queued) {
 			/*
@@ -1593,7 +1593,7 @@ static int rconfc_herd_destroy(struct m0_rconfc *rconfc)
 
 	rconfc_active_all_unlink(rconfc);
 	rc = rconfc_herd_fini(rconfc);
-	if (rc == 0)
+	if (M0_IN(rc, (0, -EAGAIN)))
 		rconfc_herd_prune(rconfc);
 
 	return M0_RC(rc);
@@ -2567,7 +2567,7 @@ static void rconfc_version_elected(struct m0_sm_group *grp,
 
 	rc = rconfc_quorum_is_reached(rconfc) ?
 		rconfc_conductor_engage(rconfc) : -EPROTO;
-	if (rc != 0) {
+	if (rc != 0 && rc != -EAGAIN) {
 		M0_ERR_INFO(rc, "re-election started");
 		rc = rconfc_herd_destroy(rconfc);
 		if (rc != 0) {
