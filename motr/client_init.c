@@ -65,7 +65,7 @@ static const struct m0_bob_type m0c_bobtype = {
  * attaches to. It is closed after Client initilisation is done as it
  * may become invalid at some point of time.
  */
-struct m0_conf_root *conf_root;
+struct m0_conf_root *conf_root = NULL;
 
 /**
  * The Initialisation code in client is fiddly, lots of different parts of motr

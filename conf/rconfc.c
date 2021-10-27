@@ -1593,8 +1593,10 @@ static int rconfc_herd_destroy(struct m0_rconfc *rconfc)
 
 	rconfc_active_all_unlink(rconfc);
 	rc = rconfc_herd_fini(rconfc);
-	if (M0_IN(rc, (0, -EAGAIN)))
+	if (M0_IN(rc, (0, -EAGAIN))) {
 		rconfc_herd_prune(rconfc);
+		rc = 0;
+	}
 
 	return M0_RC(rc);
 }
@@ -2567,7 +2569,7 @@ static void rconfc_version_elected(struct m0_sm_group *grp,
 
 	rc = rconfc_quorum_is_reached(rconfc) ?
 		rconfc_conductor_engage(rconfc) : -EPROTO;
-	if (rc != 0 && rc != -EAGAIN) {
+	if (rc != 0) {
 		M0_ERR_INFO(rc, "re-election started");
 		rc = rconfc_herd_destroy(rconfc);
 		if (rc != 0) {
